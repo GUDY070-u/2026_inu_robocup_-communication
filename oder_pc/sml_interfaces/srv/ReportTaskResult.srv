@@ -1,0 +1,10 @@
+int32 step
+bool success
+string action
+int32[] object_ids
+string station_id
+string source
+string message
+---
+bool accepted
+string message
