@@ -28,15 +28,6 @@ from sml_msgs.msg import Step, Task
 from sml_msgs.srv import ArmCommand, GetPlan
 
 
-# 실패 시 AMR이 돌아갈 시작/종료 스테이션
-STATION_START_GOAL = 0
-
-# MAX_RETRY=1이면 총 2회 시도: 최초 1회 + 재시도 1회
-MAX_NAV_RETRY = 1
-MAX_ARM_RETRY = 1
-MAX_POST_RETRY = 1
-
-
 class SmlManagerNode(Node):
 
     def __init__(self):
@@ -50,7 +41,6 @@ class SmlManagerNode(Node):
         self.amr_busy        = False    # AMR 트랙 점유 여부
         self.wb_busy         = False    # WB 트랙 점유 여부
         self.plan_requested  = False    # GetPlan 요청 여부 (중복 방지)
-        self.abort_requested = False    # 치명 실패 후 안전 복귀/중단 상태
 
         # GetPlan 재시도 관련
         self._plan_retry_count = 0
@@ -63,8 +53,11 @@ class SmlManagerNode(Node):
         )
 
         # ── Subscriber ─────────────────────────────────────
+        self.declare_parameter('task_topic', '/sml/task')
+        task_topic = self.get_parameter('task_topic').value
+
         self.task_sub = self.create_subscription(
-            Task, '/sml/task',
+            Task, task_topic,
             self.task_callback, 10,
             callback_group=self.cbg)
 
@@ -92,7 +85,7 @@ class SmlManagerNode(Node):
         self.status_pub = self.create_publisher(
             String, '/sml/status', 10)
 
-        self.get_logger().info('[MANAGER] sml_manager_node 시작')
+        self.get_logger().info(f'[MANAGER] sml_manager_node 시작 | task_topic={task_topic}')
 
     # ──────────────────────────────────────────────────────
     # Task 수신 → GetPlan 요청
@@ -106,7 +99,6 @@ class SmlManagerNode(Node):
 
         self.get_logger().info('[MANAGER] Task 수신 → 1초 후 GetPlan 요청')
         self._plan_retry_count = 0
-
         # planning_node가 계획을 생성할 시간을 준 뒤 요청
         self._plan_timer = self.create_timer(1.0, self._try_get_plan)
 
@@ -158,7 +150,7 @@ class SmlManagerNode(Node):
             self.plan_requested = False
 
     # ──────────────────────────────────────────────────────
-    # 스텝 디스패치
+    # 스텝 디스패치 (핵심 로직)
     # ──────────────────────────────────────────────────────
 
     def _dispatch(self):
@@ -167,15 +159,10 @@ class SmlManagerNode(Node):
         wb_step  = None
 
         with self._lock:
-            # 실패 후 안전 복귀 중/완료 상태에서는 새 step을 더 이상 실행하지 않는다.
-            if self.abort_requested:
-                return
-
             for step in list(self.pending_steps):
                 deps_ok = all(
                     d in self.completed_steps
                     for d in step.depends_on)
-
                 if not deps_ok:
                     continue
 
@@ -195,13 +182,9 @@ class SmlManagerNode(Node):
                     break
 
             remaining = len(self.pending_steps)
-            all_done  = (
-                remaining == 0
-                and not self.amr_busy
-                and not self.wb_busy
-                and amr_step is None
-                and wb_step is None
-            )
+            all_done  = (remaining == 0
+                         and not self.amr_busy and not self.wb_busy
+                         and amr_step is None and wb_step is None)
 
         # lock 밖에서 실행
         if amr_step:
@@ -241,12 +224,13 @@ class SmlManagerNode(Node):
     # ──────────────────────────────────────────────────────
 
     def _execute_amr(self, step, retry=0):
+        MAX_RETRY = 1
+
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error(
                 f'[NAV] step {step.step_id}: nav 서버 없음')
-            self._abort_and_return_home(
-                f'NAV step {step.step_id}: nav 서버 없음'
-            )
+            with self._lock:
+                self.amr_busy = False
             return
 
         goal = NavTask.Goal()
@@ -260,34 +244,12 @@ class SmlManagerNode(Node):
             lambda f, s=step, r=retry: self._on_nav_accepted(f, s, r))
 
     def _on_nav_accepted(self, future, step, retry):
-        try:
-            goal_handle = future.result()
-        except Exception as e:
-            self.get_logger().error(
-                f'[NAV] step {step.step_id} goal 전송 예외: {e} | '
-                f'target_station={step.station_id}, '
-                f'objects={list(step.object_ids)}, '
-                f'action={step.action}, '
-                f'retry={retry}, '
-                f'completed_steps={sorted(list(self.completed_steps))}'
-            )
-            self._abort_and_return_home(
-                f'NAV step {step.step_id} goal 전송 예외: {e}'
-            )
-            return
-
+        goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().error(
-                f'[NAV] step {step.step_id} goal 거절됨 | '
-                f'target_station={step.station_id}, '
-                f'objects={list(step.object_ids)}, '
-                f'action={step.action}, '
-                f'retry={retry}, '
-                f'completed_steps={sorted(list(self.completed_steps))}'
-            )
-            self._abort_and_return_home(
-                f'NAV step {step.step_id} goal 거절'
-            )
+                f'[NAV] step {step.step_id} goal 거절됨')
+            with self._lock:
+                self.amr_busy = False
             return
 
         result_future = goal_handle.get_result_async()
@@ -295,55 +257,21 @@ class SmlManagerNode(Node):
             lambda f, s=step, r=retry: self._on_nav_result(f, s, r))
 
     def _on_nav_result(self, future, step, retry):
-        try:
-            result = future.result().result
-        except Exception as e:
-            self.get_logger().error(
-                f'[NAV] step {step.step_id} 결과 수신 예외: {e} | '
-                f'target_station={step.station_id}, '
-                f'objects={list(step.object_ids)}, '
-                f'action={step.action}, '
-                f'retry={retry}, '
-                f'completed_steps={sorted(list(self.completed_steps))}'
-            )
-            self._abort_and_return_home(
-                f'NAV step {step.step_id} 결과 수신 예외: {e}'
-            )
-            return
+        MAX_RETRY = 1
+        result = future.result().result
 
         if not result.success:
             self.get_logger().error(
-                f'[NAV] step {step.step_id} 실패: {result.fail_reason} | '
-                f'target_station={step.station_id}, '
-                f'objects={list(step.object_ids)}, '
-                f'action={step.action}, '
-                f'retry={retry}, '
-                f'completed_steps={sorted(list(self.completed_steps))}'
-            )
-
-            # 기존에는 NAV_FAILED만 재시도했지만,
-            # 실제 로그에서 TIMEOUT이 발생했으므로 TIMEOUT도 재시도 대상에 포함한다.
-            if retry < MAX_NAV_RETRY and result.fail_reason in ['NAV_FAILED', 'TIMEOUT']:
+                f'[NAV] step {step.step_id} 실패: {result.fail_reason}')
+            if retry < MAX_RETRY and result.fail_reason == 'NAV_FAILED':
                 self.get_logger().warn(
-                    f'[NAV] step {step.step_id} 재시도 '
-                    f'({retry + 1}/{MAX_NAV_RETRY}) | '
-                    f'target_station={step.station_id}, '
-                    f'objects={list(step.object_ids)}, '
-                    f'fail_reason={result.fail_reason}'
-                )
+                    f'[NAV] step {step.step_id} 재시도 ({retry+1}/{MAX_RETRY})')
                 self._execute_amr(step, retry + 1)
             else:
                 self.get_logger().error(
-                    f'[NAV] step {step.step_id} 최종 실패 | '
-                    f'target_station={step.station_id}, '
-                    f'objects={list(step.object_ids)}, '
-                    f'action={step.action}, '
-                    f'fail_reason={result.fail_reason}, '
-                    f'completed_steps={sorted(list(self.completed_steps))}'
-                )
-                self._abort_and_return_home(
-                    f'NAV step {step.step_id} 최종 실패: {result.fail_reason}'
-                )
+                    f'[NAV] step {step.step_id} 최종 실패')
+                with self._lock:
+                    self.amr_busy = False
             return
 
         self.get_logger().info(
@@ -362,12 +290,13 @@ class SmlManagerNode(Node):
         self._execute_arm(step)
 
     def _execute_arm(self, step, retry=0):
+        MAX_RETRY = 1
+
         if not self.arm_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().error(
                 f'[ARM] step {step.step_id}: arm 서비스 없음')
-            self._abort_and_return_home(
-                f'ARM step {step.step_id}: arm 서비스 없음'
-            )
+            with self._lock:
+                self.amr_busy = False
             return
 
         req = ArmCommand.Request()
@@ -384,33 +313,31 @@ class SmlManagerNode(Node):
             lambda f, s=step, r=retry: self._on_arm_result(f, s, r))
 
     def _on_arm_result(self, future, step, retry):
+        MAX_RETRY = 1
+
         try:
             response = future.result()
         except Exception as e:
             self.get_logger().error(
                 f'[ARM] step {step.step_id} 예외: {e}')
-            self._abort_and_return_home(
-                f'ARM step {step.step_id} 예외: {e}'
-            )
+            with self._lock:
+                self.amr_busy = False
             return
 
         if not response.success:
             self.get_logger().error(
                 f'[ARM] step {step.step_id} 실패: {response.message}')
-
-            # MAX_ARM_RETRY=1이면 총 2회 시도한다.
-            # 예: 최초 실패 → 재시도 1회 → 다시 실패하면 station 0 복귀
-            if retry < MAX_ARM_RETRY:
+            # OBJECT_NOT_FOUND는 재시도 의미 없음
+            retriable = 'object not found' not in response.message.lower()
+            if retry < MAX_RETRY and retriable:
                 self.get_logger().warn(
-                    f'[ARM] step {step.step_id} 재시도 '
-                    f'({retry + 1}/{MAX_ARM_RETRY})')
+                    f'[ARM] step {step.step_id} 재시도 ({retry+1}/{MAX_RETRY})')
                 self._execute_arm(step, retry + 1)
             else:
                 self.get_logger().error(
                     f'[ARM] step {step.step_id} 최종 실패')
-                self._abort_and_return_home(
-                    f'ARM step {step.step_id} 최종 실패: {response.message}'
-                )
+                with self._lock:
+                    self.amr_busy = False
             return
 
         self.get_logger().info(
@@ -419,12 +346,13 @@ class SmlManagerNode(Node):
         self._execute_nav_post_process(step)
 
     def _execute_nav_post_process(self, step, retry=0):
+        MAX_RETRY = 1
+
         if not self.post_process_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().error(
                 f'[POST] step {step.step_id}: post_process 서비스 없음')
-            self._abort_and_return_home(
-                f'POST step {step.step_id}: post_process 서비스 없음'
-            )
+            with self._lock:
+                self.amr_busy = False
             return
 
         self.get_logger().info(
@@ -436,149 +364,40 @@ class SmlManagerNode(Node):
                 f, s, r))
 
     def _on_nav_post_process_result(self, future, step, retry):
+        MAX_RETRY = 1
+
         try:
             response = future.result()
         except Exception as e:
             self.get_logger().error(
                 f'[POST] step {step.step_id} 예외: {e}')
-
-            if retry < MAX_POST_RETRY:
+            if retry < MAX_RETRY:
                 self.get_logger().warn(
                     f'[POST] step {step.step_id} 재시도 '
-                    f'({retry + 1}/{MAX_POST_RETRY})')
+                    f'({retry+1}/{MAX_RETRY})')
                 self._execute_nav_post_process(step, retry + 1)
             else:
-                self._abort_and_return_home(
-                    f'POST step {step.step_id} 예외: {e}'
-                )
+                with self._lock:
+                    self.amr_busy = False
             return
 
         if not response.success:
             self.get_logger().error(
                 f'[POST] step {step.step_id} 실패: {response.message}')
-
-            if retry < MAX_POST_RETRY and response.message != 'NO_PENDING_POST_PROCESS':
+            if retry < MAX_RETRY and response.message != 'NO_PENDING_POST_PROCESS':
                 self.get_logger().warn(
                     f'[POST] step {step.step_id} 재시도 '
-                    f'({retry + 1}/{MAX_POST_RETRY})')
+                    f'({retry+1}/{MAX_RETRY})')
                 self._execute_nav_post_process(step, retry + 1)
-            elif response.message == 'NO_PENDING_POST_PROCESS':
-                # 후처리할 것이 없다는 응답은 치명 실패로 보지 않고 step 완료 처리
-                self.get_logger().warn(
-                    f'[POST] step {step.step_id}: 후처리 없음 → 완료 처리')
+            else:
                 with self._lock:
                     self.amr_busy = False
-                self._on_step_complete(step.step_id)
-            else:
-                self._abort_and_return_home(
-                    f'POST step {step.step_id} 최종 실패: {response.message}'
-                )
             return
 
         self.get_logger().info(f'[POST] step {step.step_id} 완료')
         with self._lock:
             self.amr_busy = False
         self._on_step_complete(step.step_id)
-
-    def _abort_and_return_home(self, reason: str):
-        """
-        AMR/NAV/ARM에서 치명 실패가 발생했을 때 전체 계획을 중단하고
-        AMR을 station 0으로 복귀시킨다.
-
-        주의:
-        - 실패한 step은 completed_steps에 넣지 않는다.
-        - pending_steps를 비워 후속 작업이 실행되지 않게 한다.
-        - 복귀 NAV는 ARM 없이 station 0 이동만 수행한다.
-        """
-        self.get_logger().error(
-            f'[SAFETY] 작업 중단 → station {STATION_START_GOAL} 복귀: {reason}')
-        self._publish_status(
-            f'중단: {reason} → station {STATION_START_GOAL} 복귀')
-
-        with self._lock:
-            self.abort_requested = True
-            self.pending_steps.clear()
-            self.amr_busy = True
-
-        self._return_home_after_failure(reason)
-
-    def _return_home_after_failure(self, reason: str, retry=0):
-        if not self.nav_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().error(
-                f'[SAFETY] station {STATION_START_GOAL} 복귀 실패: nav 서버 없음')
-            with self._lock:
-                self.amr_busy = False
-            self._publish_status('중단: station 0 복귀 실패 - nav 서버 없음')
-            return
-
-        goal = NavTask.Goal()
-        goal.station_id = STATION_START_GOAL
-
-        self.get_logger().warn(
-            f'[SAFETY] station {STATION_START_GOAL} 복귀 이동 시작 '
-            f'({retry}/{MAX_NAV_RETRY})')
-
-        send_future = self.nav_client.send_goal_async(goal)
-        send_future.add_done_callback(
-            lambda f, r=reason, rt=retry: self._on_return_home_accepted(f, r, rt))
-
-    def _on_return_home_accepted(self, future, reason: str, retry: int):
-        try:
-            goal_handle = future.result()
-        except Exception as e:
-            self.get_logger().error(
-                f'[SAFETY] station 0 복귀 goal 예외: {e}')
-            with self._lock:
-                self.amr_busy = False
-            self._publish_status('중단: station 0 복귀 goal 예외')
-            return
-
-        if not goal_handle.accepted:
-            self.get_logger().error('[SAFETY] station 0 복귀 goal 거절됨')
-            with self._lock:
-                self.amr_busy = False
-            self._publish_status('중단: station 0 복귀 goal 거절')
-            return
-
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(
-            lambda f, r=reason, rt=retry: self._on_return_home_result(f, r, rt))
-
-    def _on_return_home_result(self, future, reason: str, retry: int):
-        try:
-            result = future.result().result
-        except Exception as e:
-            self.get_logger().error(
-                f'[SAFETY] station 0 복귀 결과 예외: {e}')
-            with self._lock:
-                self.amr_busy = False
-            self._publish_status('중단: station 0 복귀 결과 예외')
-            return
-
-        if not result.success:
-            self.get_logger().error(
-                f'[SAFETY] station 0 복귀 실패: {result.fail_reason}')
-
-            if retry < MAX_NAV_RETRY:
-                self.get_logger().warn(
-                    f'[SAFETY] station 0 복귀 재시도 '
-                    f'({retry + 1}/{MAX_NAV_RETRY})')
-                self._return_home_after_failure(reason, retry + 1)
-                return
-
-            with self._lock:
-                self.amr_busy = False
-            self._publish_status('중단: station 0 복귀 최종 실패')
-            return
-
-        self.get_logger().info(
-            f'[SAFETY] station {STATION_START_GOAL} 복귀 완료. '
-            f'원인: {reason}')
-
-        with self._lock:
-            self.amr_busy = False
-
-        self._publish_status('중단: station 0 복귀 완료')
 
     # ──────────────────────────────────────────────────────
     # WB 스텝 실행
@@ -593,12 +412,10 @@ class SmlManagerNode(Node):
             return
 
         goal = WbTask.Goal()
-        goal.work_type  = (
-            'PRODUCE'
-            if step.action == Step.PRODUCE
-            else 'RECYCLE'
-        )
-        goal.product_id = step.object_ids[0]
+        goal.work_type  = ('PRODUCE'
+                           if step.action == Step.PRODUCE
+                           else 'RECYCLE')
+        goal.product_id = step.object_ids[0]  # [13] 또는 [81]의 첫 번째
 
         self.get_logger().info(
             f'[WB] step {step.step_id} → '
@@ -607,7 +424,6 @@ class SmlManagerNode(Node):
         send_future = self.wb_client.send_goal_async(
             goal,
             feedback_callback=lambda fb, s=step: self._on_wb_feedback(fb, s))
-
         send_future.add_done_callback(
             lambda f, s=step, r=retry: self._on_wb_accepted(f, s, r))
 
@@ -618,15 +434,7 @@ class SmlManagerNode(Node):
             f'{fb.status}')
 
     def _on_wb_accepted(self, future, step, retry):
-        try:
-            goal_handle = future.result()
-        except Exception as e:
-            self.get_logger().error(
-                f'[WB] step {step.step_id} goal 전송 예외: {e}')
-            with self._lock:
-                self.wb_busy = False
-            return
-
+        goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().error(
                 f'[WB] step {step.step_id} goal 거절됨')
@@ -639,14 +447,7 @@ class SmlManagerNode(Node):
             lambda f, s=step, r=retry: self._on_wb_result(f, s, r))
 
     def _on_wb_result(self, future, step, retry):
-        try:
-            result = future.result().result
-        except Exception as e:
-            self.get_logger().error(
-                f'[WB] step {step.step_id} 결과 수신 예외: {e}')
-            with self._lock:
-                self.wb_busy = False
-            return
+        result = future.result().result
 
         if not result.success:
             self.get_logger().error(
@@ -670,11 +471,7 @@ class SmlManagerNode(Node):
         self.status_pub.publish(status)
 
     def _log_steps(self, steps):
-        type_map = {
-            Step.AMR: 'AMR',
-            Step.WB:  'WB ',
-        }
-
+        type_map   = {Step.AMR: 'AMR', Step.WB: 'WB '}
         action_map = {
             Step.LOAD:    'LOAD   ',
             Step.UNLOAD:  'UNLOAD ',
@@ -682,9 +479,7 @@ class SmlManagerNode(Node):
             Step.RECYCLE: 'RECYCLE',
             Step.GOAL:    'GOAL   ',
         }
-
         self.get_logger().info('===== 수신된 스텝 시퀀스 =====')
-
         for s in steps:
             self.get_logger().info(
                 f'[{s.step_id:2d}] {type_map.get(s.type, "??")} | '
@@ -692,17 +487,14 @@ class SmlManagerNode(Node):
                 f'objects={list(s.object_ids)} | '
                 f'station={s.station_id} | '
                 f'depends_on={list(s.depends_on)}')
-
         self.get_logger().info('==============================')
 
 
 def main(args=None):
     rclpy.init(args=args)
-
     node = SmlManagerNode()
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
-
     try:
         executor.spin()
     except KeyboardInterrupt:

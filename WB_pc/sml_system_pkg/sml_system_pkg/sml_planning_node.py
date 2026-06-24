@@ -1,30 +1,35 @@
 """
-sml_planning_node.py
+planning_node.py
+Task.msg를 수신해서 depends_on 기반 스텝 시퀀스를 생성하고
+ManagerNode 요청 시 전달하는 노드.
 
-Task.msg를 수신해서 시간 비용 기반으로 작업 순서를 결정하고,
-depends_on 기반 Step 시퀀스를 생성한 뒤 ManagerNode 요청 시 전달하는 노드.
+반영된 규칙
+1. batch ID 해석
+   - 10,20,...,80은 각각 raw 1,2,...,8 두 개를 담은 batch로 취급한다.
+   - AMR LOAD/UNLOAD object_ids에는 raw로 풀지 않고 실제 batch ID를 넣는다.
 
-반영 내용:
-1. 주문 입력 순서를 그대로 따르지 않음
-2. 생산 / 재활용 / 라이프사이클에 공통 적용 가능한 시간 비용 함수 추가
-3. AMR 이동 속도, 비전 인식, 적재/하역, 조립/분해 예상 시간 반영
-4. JSON 좌표 파일을 받아 station_id별 예상 좌표 사용
-5. JSON 경로 기본값을 코드에 내장
-6. 비용이 낮은 작업을 우선 선택하되, recycle -> produce 의존성 유지
-7. lifecycle은 다음 두 방식 모두 대응
-   - order_type == Order.OT_LIFECYCLE 또는 order_type == 3
-   - 같은 product_id에 대해 PRODUCE와 RECYCLE이 동시에 존재하는 경우
-8. AMR 적재 제약 분리
-   - 원재료 슬롯: 최대 5개
-   - 완성품/재활용 대상 제품 슬롯: 최대 1개
-9. PRODUCE 작업에서도 남는 원재료 슬롯에 미래 PRODUCE 재료를 미리 적재
-10. 현재 주문 때문에 이미 방문할 station의 미래 재료를 우선 적재
+2. RECYCLE source 규칙
+   - Order.OT_RECYCLE product_id는 무조건 CUSTOMER station에 있다고 가정한다.
+   - customer.material_ids에 product_id가 없어도 CUSTOMER에서 LOAD하도록 계획한다.
+
+3. Lifecycle 역추론 규칙
+   P = PRODUCE 필요 원재료
+   R = RECYCLE 분해 결과 원재료
+   C = P와 R의 공통 원재료
+
+   arena_layout의 storage/hybrid material_ids는
+   (P - C) + (R - C)로 생성되었다고 보고 역추론한다.
+
+   P - C : PRODUCE에 바로 사용할 초기 재료
+   C     : RECYCLE 후 WB에서 PRODUCE에 바로 재사용할 재료
+   R - C : RECYCLE 후 station에 반납해야 할 leftover target
 """
 
 import copy
 import json
 import math
 import os
+from collections import Counter
 
 import rclpy
 from rclpy.node import Node
@@ -34,29 +39,35 @@ from sml_msgs.srv import GetPlan
 
 
 PRODUCT_NAMES = {
-    34: 'Battery',
-    13: 'Magnet',
-    81: 'E-Stop',
-    442: 'Carrot',
-    241: 'Traffic Light',
-    462: 'Small Tree',
-    711: 'Hammer',
-    4482: 'Big Carrot',
-    8518: 'Burger',
-    48132: 'Ice Cream',
-    46262: 'Big Tree',
+    34: 'Battery', 13: 'Magnet', 81: 'E-Stop',
+    442: 'Carrot', 241: 'Traffic Light', 462: 'Small Tree',
+    711: 'Hammer', 4482: 'Big Carrot', 8518: 'Burger',
+    48132: 'Ice Cream', 46262: 'Big Tree',
 }
+
+RAW_TO_BATCH = {
+    1: 10,
+    2: 20,
+    3: 30,
+    4: 40,
+    5: 50,
+    6: 60,
+    7: 70,
+    8: 80,
+}
+BATCH_TO_RAW = {batch: raw for raw, batch in RAW_TO_BATCH.items()}
+BATCH_SIZE = 2
 
 # --------------------------------------------------------
 # 경기 / 시스템 시간 가정값
 # --------------------------------------------------------
 
 AMR_SPEED = 13.0              # [m/s]
-VISION_TIME_AVG = 2.0         # [s]  비전 인식 평균 1~3초 중 평균값
+VISION_TIME_AVG = 2.0         # [s] 비전 인식 평균값
 LOAD_TIME = 10.0              # [s/item]
 UNLOAD_TIME = 10.0            # [s/item]
-ASSEMBLY_PAIR_TIME = 12.5     # [s/connection] 10~15초 평균
-DISASSEMBLY_PAIR_TIME = 12.5  # [s/disconnection] 임시로 조립과 동일 가정
+ASSEMBLY_PAIR_TIME = 12.5     # [s/connection]
+DISASSEMBLY_PAIR_TIME = 12.5  # [s/disconnection]
 
 # --------------------------------------------------------
 # AMR 적재 제약
@@ -65,24 +76,20 @@ DISASSEMBLY_PAIR_TIME = 12.5  # [s/disconnection] 임시로 조립과 동일 가
 MAX_RAW_CAPACITY = 5
 MAX_PRODUCT_CAPACITY = 1
 
-# 대회 arena_layout에는 포함되지 않는 AMR의 시작/복귀 지점
+# 대회 arena_layout에는 포함되지 않는 AMR의 시작/복귀 지점.
 STATION_START_GOAL = 0
 
-# 현재 메인 Workbench로 사용할 station_id
-MAIN_WORKBENCH_STATION_ID = 6
+# 기존 A-zone 좌표 기준에서는 station 5가 A_MAIN_WORKBENCH다.
+# arena_layout에 5번 workbench가 없으면 들어온 workbench 중 비용이 작은 station을 선택한다.
+MAIN_WORKBENCH_STATION_ID = 5
 
-# ROS parameter 이름
-# 중요: 여기에 파일 경로를 직접 넣으면 안 됨
 STATION_COORD_JSON_PARAM = 'station_coord_json_path'
-
-# JSON 좌표 파일 기본 경로
 DEFAULT_STATION_COORD_JSON_PATH = (
     '/home/user/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
 )
 
 # 메시지에 OT_LIFECYCLE이 없을 수도 있으므로 3을 fallback으로 사용
 ORDER_TYPE_LIFECYCLE = getattr(Order, 'OT_LIFECYCLE', 3)
-
 
 class PlanningNode(Node):
 
@@ -92,27 +99,27 @@ class PlanningNode(Node):
         self.plan_generated = False
         self.steps = []
 
+        self.declare_parameter('task_topic', '/sml/task')
+        self.declare_parameter('use_time_cost', True)
+        self.declare_parameter('amr_speed_mps', AMR_SPEED)
         self.declare_parameter(
             STATION_COORD_JSON_PARAM,
             DEFAULT_STATION_COORD_JSON_PATH
         )
 
-        self.station_coord_overrides = self._load_station_coord_json()
+        task_topic = self.get_parameter('task_topic').value
+        self.use_time_cost = bool(self.get_parameter('use_time_cost').value)
+        self.amr_speed_mps = float(self.get_parameter('amr_speed_mps').value)
+        self.station_coords = self._load_station_coord_json()
 
         self.task_sub = self.create_subscription(
-            Task,
-            '/sml/task',
-            self.task_callback,
-            10
+            Task, task_topic, self.task_callback, 10
         )
-
         self.plan_srv = self.create_service(
-            GetPlan,
-            '/sml/get_plan',
-            self.get_plan_callback
+            GetPlan, '/sml/get_plan', self.get_plan_callback
         )
 
-        self.get_logger().info('PlanningNode 시작')
+        self.get_logger().info(f'PlanningNode 시작 | task_topic={task_topic} | use_time_cost={self.use_time_cost} | coords={len(self.station_coords)}')
 
     # --------------------------------------------------------
     # 콜백
@@ -121,9 +128,8 @@ class PlanningNode(Node):
     def task_callback(self, task):
         if self.plan_generated:
             return
-
         self.plan_generated = True
-        self.get_logger().info('Task 수신 → 시간 비용 기반 계획 생성 시작')
+        self.get_logger().info('Task 수신 → 계획 생성 시작')
         self._build_plan(task)
 
     def get_plan_callback(self, request, response):
@@ -131,11 +137,9 @@ class PlanningNode(Node):
             response.success = False
             response.message = '계획이 아직 생성되지 않았습니다'
             return response
-
         response.steps = self.steps
         response.success = True
         response.message = ''
-
         self.get_logger().info(f'GetPlan 응답: {len(self.steps)}개 스텝 전달')
         return response
 
@@ -145,60 +149,39 @@ class PlanningNode(Node):
 
     def _build_plan(self, task):
         try:
-            station_materials, station_types, station_coords, wb_id, customer_id, storage_id = \
-                self._parse_arena(task.arena_layout)
+            produce_orders, recycle_orders = \
+                self._parse_orders(task.order_list)
 
-            produce_orders, recycle_orders = self._parse_orders(task.order_list)
-
-            self._mark_recycle_after_produce(produce_orders, recycle_orders)
-
-            virtual_stock = copy.deepcopy(station_materials)
-
-            produced_product_ids = {o['product_id'] for o in produce_orders}
-
-            recycle_releases = self._register_recycle_releases(
-                recycle_orders,
-                produced_product_ids
+            material_model = self._build_material_model(
+                produce_orders, recycle_orders
             )
 
+            station_items, stock_tokens, waste_target_tokens, wb_id, customer_id, storage_id = \
+                self._parse_arena(task.arena_layout, material_model)
+
+            # stock_tokens는 예약하면서 remaining을 차감하므로 deepcopy해서 사용
+            virtual_stock_tokens = copy.deepcopy(stock_tokens)
+            recycle_releases = self._register_recycle_releases(recycle_orders)
             self._assign_material_sources(
-                produce_orders,
-                recycle_releases,
-                virtual_stock
+                produce_orders, recycle_releases, virtual_stock_tokens, wb_id
             )
-
-            self._assign_waste_materials(recycle_orders, produce_orders)
+            self._assign_waste_materials(
+                recycle_orders, produce_orders,
+                copy.deepcopy(waste_target_tokens), storage_id, wb_id
+            )
 
             wb_sequence = self._build_wb_sequence(
-                produce_orders,
-                recycle_orders,
-                station_materials,
-                station_coords,
-                wb_id,
-                customer_id,
-                storage_id
+                produce_orders, recycle_orders, wb_id, customer_id
             )
 
             self.steps = self._generate_steps(
-                wb_sequence,
-                station_materials,
-                station_coords,
-                wb_id,
-                customer_id,
-                storage_id
+                wb_sequence, station_items,
+                wb_id, customer_id, storage_id
             )
 
             self.get_logger().info(f'계획 생성 완료: {len(self.steps)}개 스텝')
-
-            self._log_cost_summary(
-                wb_sequence,
-                station_materials,
-                station_coords,
-                wb_id,
-                customer_id,
-                storage_id
-            )
-
+            self._log_cost_summary(wb_sequence, wb_id, customer_id)
+            self._log_material_model(material_model)
             self._log_plan_summary(produce_orders, recycle_orders)
             self._log_steps(self.steps)
 
@@ -217,8 +200,7 @@ class PlanningNode(Node):
 
         if not path:
             self.get_logger().warn(
-                'station_coord_json_path가 비어 있습니다. '
-                'arena_layout에 좌표가 없으면 이동 시간은 0으로 계산됩니다.'
+                'station_coord_json_path가 비어 있습니다. 이동 시간은 fallback 좌표로 계산됩니다.'
             )
             return {}
 
@@ -276,10 +258,8 @@ class PlanningNode(Node):
                     coords[int(station_id)] = (float(x), float(y))
 
             self.get_logger().info(
-                f'station 좌표 JSON 로드 완료: '
-                f'{len(coords)}개 station, path={path}'
+                f'station 좌표 JSON 로드 완료: {len(coords)}개 station, path={path}'
             )
-
             return coords
 
         except Exception as e:
@@ -290,762 +270,524 @@ class PlanningNode(Node):
     # Step 2: 입력 파싱
     # --------------------------------------------------------
 
-    def _parse_arena(self, arena_layout):
-        station_materials = {}
-        station_types = {}
-        station_coords = {}
-
-        wb_id = None
-        customer_id = None
-        storage_id = None
-
-        for station in arena_layout:
-            station_id = station.station_id
-
-            station_materials[station_id] = list(station.material_ids)
-            station_types[station_id] = station.station_type
-
-            json_xy = self.station_coord_overrides.get(station_id)
-            msg_xy = self._extract_station_xy(station)
-            xy = json_xy if json_xy is not None else msg_xy
-
-            if xy is not None:
-                station_coords[station_id] = xy
-
-            if (
-                station.station_type == Station.ST_WORKBENCH
-                and station.station_id == MAIN_WORKBENCH_STATION_ID
-            ):
-                wb_id = station.station_id
-
-            elif station.station_type == Station.ST_CUSTOMER:
-                customer_id = station.station_id
-
-            elif station.station_type == Station.ST_STORAGE and storage_id is None:
-                storage_id = station.station_id
-
-        for station_id, xy in self.station_coord_overrides.items():
-            if station_id not in station_coords:
-                station_coords[station_id] = xy
-
-        if STATION_START_GOAL not in station_coords:
-            station_coords[STATION_START_GOAL] = None
-
-        if wb_id is None:
-            raise RuntimeError(
-                f'메인 workbench station {MAIN_WORKBENCH_STATION_ID}가 '
-                'arena_layout에 없습니다'
-            )
-
-        self.get_logger().info(
-            f'arena 파싱 완료: stations={len(station_materials)}, '
-            f'coords={len([v for v in station_coords.values() if v is not None])}'
-        )
-
-        return station_materials, station_types, station_coords, wb_id, customer_id, storage_id
-
-    def _extract_station_xy(self, station):
-        if hasattr(station, 'x') and hasattr(station, 'y'):
-            return float(station.x), float(station.y)
-
-        if hasattr(station, 'pos_x') and hasattr(station, 'pos_y'):
-            return float(station.pos_x), float(station.pos_y)
-
-        if hasattr(station, 'position'):
-            pos = station.position
-            if hasattr(pos, 'x') and hasattr(pos, 'y'):
-                return float(pos.x), float(pos.y)
-
-        if hasattr(station, 'pose'):
-            pose = station.pose
-            if hasattr(pose, 'position'):
-                pos = pose.position
-                if hasattr(pos, 'x') and hasattr(pos, 'y'):
-                    return float(pos.x), float(pos.y)
-
-        return None
-
     def _parse_orders(self, order_list):
         produce_orders = []
         recycle_orders = []
 
-        for index, order in enumerate(order_list):
-            base = {
-                'uid': f'order_{index}',
-                'order_type': order.order_type,
-                'product_id': order.product_id,
-                'materials': self._parse_product_id(order.product_id),
+        for order in order_list:
+            parsed = {
+                'order_type':       order.order_type,
+                'product_id':       order.product_id,
+                'materials':        self._parse_product_id(order.product_id),
+                # material_sources: [(material, source, dep_recycle, object_id, token_ref), ...]
+                # source가 station_id이면 AMR이 object_id를 source에서 LOAD한다.
+                # source가 'WB'이면 해당 material은 RECYCLE 후 WB에서 바로 재사용한다.
                 'material_sources': [],
-                'waste_materials': [],
-                'reuse_materials': [],
+                'waste_materials':  [],
+                # waste_items: [{'raw': m, 'object_id': x, 'station_id': y, 'token_ref': z}, ...]
+                'waste_items':      [],
+                'reuse_materials':  [],
                 'source_after_produce': False,
-                'is_lifecycle_part': False,
-                'has_following_recycle': False,
             }
-
             if order.order_type == Order.OT_PRODUCE:
-                produce_orders.append(base)
-
+                produce_orders.append(parsed)
             elif order.order_type == Order.OT_RECYCLE:
-                recycle_orders.append(base)
-
+                recycle_orders.append(parsed)
             elif order.order_type == ORDER_TYPE_LIFECYCLE:
-                produce_part = copy.deepcopy(base)
-                recycle_part = copy.deepcopy(base)
-
-                produce_part['uid'] = f'order_{index}_life_produce'
+                # 단일 lifecycle order가 들어오는 경우만 produce→recycle 내부 연결로 해석한다.
+                # 별도 OT_RECYCLE order는 항상 CUSTOMER에 있다고 가정한다.
+                produce_part = copy.deepcopy(parsed)
+                recycle_part = copy.deepcopy(parsed)
                 produce_part['order_type'] = Order.OT_PRODUCE
-                produce_part['is_lifecycle_part'] = True
-
-                recycle_part['uid'] = f'order_{index}_life_recycle'
                 recycle_part['order_type'] = Order.OT_RECYCLE
                 recycle_part['source_after_produce'] = True
-                recycle_part['is_lifecycle_part'] = True
-
                 produce_orders.append(produce_part)
                 recycle_orders.append(recycle_part)
 
-            else:
-                self.get_logger().warn(
-                    f'지원하지 않는 order_type={order.order_type}, '
-                    f'product_id={order.product_id} → 무시'
-                )
-
+        # 재료 개수가 적은 PRODUCE부터 처리하면 재사용/재고 배정이 단순해진다.
+        produce_orders.sort(key=lambda o: len(o['materials']))
         return produce_orders, recycle_orders
 
     def _parse_product_id(self, product_id):
         return [int(d) for d in str(product_id)]
 
-    def _mark_recycle_after_produce(self, produce_orders, recycle_orders):
-        produce_ids = {o['product_id'] for o in produce_orders}
+    def _multiset_common_preserve_order(self, left, right):
+        right_count = Counter(right)
+        common = []
+        for item in left:
+            if right_count[item] > 0:
+                common.append(item)
+                right_count[item] -= 1
+        return common
 
-        for ro in recycle_orders:
-            if ro['product_id'] in produce_ids:
-                ro['source_after_produce'] = True
-
-    # --------------------------------------------------------
-    # Step 3: 시간 비용 함수
-    # --------------------------------------------------------
-
-    def _coord_of(self, station_id, station_coords):
-        return station_coords.get(station_id)
-
-    def _move_time_between(self, station_a, station_b, station_coords):
-        if station_a is None or station_b is None:
-            return 0.0
-
-        if station_a == station_b:
-            return 0.0
-
-        a = self._coord_of(station_a, station_coords)
-        b = self._coord_of(station_b, station_coords)
-
-        if a is None or b is None:
-            return 0.0
-
-        dx = a[0] - b[0]
-        dy = a[1] - b[1]
-        dist = math.sqrt(dx * dx + dy * dy)
-
-        return dist / AMR_SPEED
-
-    def _route_move_time(self, route, station_coords):
-        total = 0.0
-
-        for i in range(len(route) - 1):
-            total += self._move_time_between(route[i], route[i + 1], station_coords)
-
-        return total
-
-    def _greedy_route(self, start_id, source_ids, end_id, station_coords):
-        route = [start_id]
-        current = start_id
-        remaining = list(dict.fromkeys(source_ids))
-
-        while remaining:
-            best = min(
-                remaining,
-                key=lambda sid: self._move_time_between(current, sid, station_coords)
-            )
-            route.append(best)
-            current = best
-            remaining.remove(best)
-
-        if end_id is not None:
-            route.append(end_id)
-
-        return route
-
-    def _logistics_cost(
-        self,
-        route,
-        n_items,
-        n_stations,
-        station_coords,
-        include_load=True,
-        include_unload=True
-    ):
-        t_move = self._route_move_time(route, station_coords)
-        t_vision = n_stations * VISION_TIME_AVG
-
-        t_load = n_items * LOAD_TIME if include_load else 0.0
-        t_unload = n_items * UNLOAD_TIME if include_unload else 0.0
-
-        return t_move + t_vision + t_load + t_unload
-
-    def _process_cost(self, task):
-        n = len(task['materials'])
-
-        if task['order_type'] == Order.OT_PRODUCE:
-            return max(0, n - 1) * ASSEMBLY_PAIR_TIME
-
-        if task['order_type'] == Order.OT_RECYCLE:
-            return max(0, n - 1) * DISASSEMBLY_PAIR_TIME
-
-        return 0.0
-
-    def _estimate_task_cost(
-        self,
-        task,
-        current_station,
-        station_materials,
-        station_coords,
-        wb_id,
-        customer_id,
-        storage_id
-    ):
-        if task['order_type'] == Order.OT_PRODUCE:
-            return self._estimate_produce_cost(
-                task,
-                current_station,
-                station_coords,
-                wb_id,
-                customer_id
-            )
-
-        if task['order_type'] == Order.OT_RECYCLE:
-            return self._estimate_recycle_cost(
-                task,
-                current_station,
-                station_materials,
-                station_coords,
-                wb_id,
-                storage_id
-            )
-
-        return float('inf')
-
-    def _estimate_produce_cost(
-        self,
-        task,
-        current_station,
-        station_coords,
-        wb_id,
-        customer_id
-    ):
-        source_to_count = {}
-
-        for material, source, dep in task['material_sources']:
-            if dep is None and isinstance(source, int):
-                source_to_count[source] = source_to_count.get(source, 0) + 1
-
-        source_ids = list(source_to_count.keys())
-        n_collect = sum(source_to_count.values())
-        n_stations = len(source_ids)
-
-        route = self._greedy_route(
-            current_station,
-            source_ids,
-            wb_id,
-            station_coords
-        )
-
-        collect_cost = self._logistics_cost(
-            route=route,
-            n_items=n_collect,
-            n_stations=n_stations,
-            station_coords=station_coords,
-            include_load=True,
-            include_unload=True
-        )
-
-        assembly_cost = self._process_cost(task)
-
-        if task.get('has_following_recycle', False):
-            deliver_cost = 0.0
-        else:
-            if customer_id is None:
-                deliver_cost = 0.0
+    def _subtract_preserve_order(self, base, remove):
+        remove_count = Counter(remove)
+        result = []
+        for item in base:
+            if remove_count[item] > 0:
+                remove_count[item] -= 1
             else:
-                deliver_route = [wb_id, customer_id]
-                deliver_cost = self._logistics_cost(
-                    route=deliver_route,
-                    n_items=1,
-                    n_stations=0,
-                    station_coords=station_coords,
-                    include_load=True,
-                    include_unload=True
-                )
+                result.append(item)
+        return result
 
-        return collect_cost + assembly_cost + deliver_cost
+    def _build_material_model(self, produce_orders, recycle_orders):
+        produce_materials = []
+        recycle_materials = []
 
-    def _estimate_recycle_cost(
-        self,
-        task,
-        current_station,
-        station_materials,
-        station_coords,
-        wb_id,
-        storage_id
-    ):
-        if task.get('source_after_produce', False):
-            collect_product_cost = 0.0
+        for order in produce_orders:
+            produce_materials.extend(order['materials'])
+        for order in recycle_orders:
+            recycle_materials.extend(order['materials'])
+
+        common = self._multiset_common_preserve_order(
+            produce_materials, recycle_materials
+        )
+        produce_initial = self._subtract_preserve_order(produce_materials, common)
+        recycle_leftover = self._subtract_preserve_order(recycle_materials, common)
+
+        return {
+            'produce_materials': produce_materials,
+            'recycle_materials': recycle_materials,
+            'common_reuse': common,
+            'produce_initial': produce_initial,
+            'recycle_leftover': recycle_leftover,
+            'produce_initial_counts': Counter(produce_initial),
+            'recycle_leftover_counts': Counter(recycle_leftover),
+        }
+
+    def _parse_arena(self, arena_layout, material_model):
+        station_items = {}
+        workbench_ids = []
+        customer_id = None
+        storage_id = None
+
+        stock_tokens = []
+        waste_target_tokens = []
+        token_ref = 0
+
+        initial_counts = Counter(material_model['produce_initial_counts'])
+        waste_counts = Counter(material_model['recycle_leftover_counts'])
+
+        for station in arena_layout:
+            station_items[station.station_id] = list(station.material_ids)
+
+            if station.station_type == Station.ST_WORKBENCH:
+                workbench_ids.append(station.station_id)
+            elif station.station_type == Station.ST_CUSTOMER:
+                customer_id = station.station_id
+            elif station.station_type == Station.ST_STORAGE and storage_id is None:
+                storage_id = station.station_id
+
+            # CUSTOMER의 material_ids는 recycle product 표시용이므로 raw stock으로 보지 않는다.
+            if station.station_type not in (Station.ST_STORAGE, Station.ST_HYBRID):
+                continue
+
+            for object_id in station.material_ids:
+                raw, raw_count = self._decode_station_object(object_id)
+                if raw is None:
+                    continue
+
+                token = {
+                    'ref': token_ref,
+                    'station_id': station.station_id,
+                    'object_id': object_id,
+                    'raw': raw,
+                    'capacity': raw_count,
+                    'remaining': raw_count,
+                }
+                token_ref += 1
+
+                # lifecycle 생성 규칙을 역추론한다.
+                # P-C에 해당하는 raw는 초기 생산 재료(stock), R-C는 recycle leftover target.
+                if initial_counts[raw] > 0:
+                    stock_tokens.append(token)
+                    initial_counts[raw] -= raw_count
+                elif waste_counts[raw] > 0:
+                    waste_target_tokens.append(token)
+                    waste_counts[raw] -= raw_count
+                else:
+                    # 공식 예시나 수동 task에서 모델과 맞지 않는 재료가 들어온 경우,
+                    # 생산 재료로 사용할 수 있도록 stock으로 둔다.
+                    stock_tokens.append(token)
+
+        if workbench_ids:
+            wb_id = self._select_workbench_by_cost(
+                workbench_ids, station_items, customer_id
+            )
         else:
-            src = self._find_in_stock(task['product_id'], station_materials)
+            raise RuntimeError('arena_layout에 WORKBENCH station이 없습니다')
 
-            if src is None:
-                return float('inf')
+        if customer_id is None:
+            raise RuntimeError('arena_layout에 CUSTOMER station이 없습니다')
+        if storage_id is None:
+            raise RuntimeError('arena_layout에 STORAGE station이 없습니다')
 
-            route = self._greedy_route(
-                current_station,
-                [src],
-                wb_id,
-                station_coords
-            )
+        return station_items, stock_tokens, waste_target_tokens, wb_id, customer_id, storage_id
 
-            collect_product_cost = self._logistics_cost(
-                route=route,
-                n_items=1,
-                n_stations=1,
-                station_coords=station_coords,
-                include_load=True,
-                include_unload=True
-            )
-
-        disassembly_cost = self._process_cost(task)
-
-        waste_count = len(task.get('waste_materials', []))
-
-        if waste_count > 0 and storage_id is not None:
-            store_route = [wb_id, storage_id]
-            store_waste_cost = self._logistics_cost(
-                route=store_route,
-                n_items=waste_count,
-                n_stations=0,
-                station_coords=station_coords,
-                include_load=True,
-                include_unload=True
-            )
-        else:
-            store_waste_cost = 0.0
-
-        return collect_product_cost + disassembly_cost + store_waste_cost
-
-    def _estimate_end_station(self, task, wb_id, customer_id, storage_id):
-        if task['order_type'] == Order.OT_PRODUCE:
-            if task.get('has_following_recycle', False):
-                return wb_id
-            return customer_id if customer_id is not None else wb_id
-
-        if task['order_type'] == Order.OT_RECYCLE:
-            if task.get('waste_materials') and storage_id is not None:
-                return storage_id
-            return wb_id
-
-        return wb_id
+    def _decode_station_object(self, object_id):
+        """station material_id를 raw 단위로 해석한다."""
+        if object_id in BATCH_TO_RAW:
+            return BATCH_TO_RAW[object_id], BATCH_SIZE
+        if 1 <= object_id <= 8:
+            return object_id, 1
+        # product_id 등은 raw stock으로 보지 않음
+        return None, 0
 
     # --------------------------------------------------------
-    # Step 4: 재료 출처 분류 + 가상 차감
+    # Step 2: 재료 출처 분류 + 가상 차감
     # --------------------------------------------------------
 
-    def _register_recycle_releases(self, recycle_orders, produced_product_ids):
+    def _register_recycle_releases(self, recycle_orders):
+        """RECYCLE 후 나올 재료 등록 → {material: [recycle_order, ...]} (개수 단위)"""
         recycle_available = {}
-
         for order in recycle_orders:
             if order.get('source_after_produce', False):
                 continue
-
             for material in order['materials']:
                 recycle_available.setdefault(material, []).append(order)
-
         return recycle_available
 
-    def _assign_material_sources(
-        self,
-        produce_orders,
-        recycle_available,
-        virtual_stock
-    ):
+    def _assign_material_sources(self, produce_orders, recycle_available, stock_tokens, wb_id):
+        """
+        재료 출처 결정 + 가상 차감
+        우선순위: RECYCLE 후 재료 → 초기 재고
+        material_sources = [(material, source, dep_recycle, object_id, token_ref), ...]
+        """
         for order in produce_orders:
             for material in order['materials']:
 
+                # 1순위: RECYCLE 후 WB에 생기는 재료
                 if material in recycle_available and recycle_available[material]:
                     recycle_order = recycle_available[material].pop(0)
                     order['material_sources'].append(
-                        (material, 'WB', recycle_order)
+                        (material, 'WB', recycle_order, material, None)
                     )
 
+                # 2순위: 초기 재고에서 가져오기
                 else:
-                    station_id = self._find_in_stock(material, virtual_stock)
-
-                    if station_id is not None:
-                        virtual_stock[station_id].remove(material)
+                    found = self._find_in_stock(material, stock_tokens, wb_id, order)
+                    if found is not None:
+                        station_id, object_id, token_ref = found
                         order['material_sources'].append(
-                            (material, station_id, None)
+                            (material, station_id, None, object_id, token_ref)
                         )
                     else:
-                        raise RuntimeError(
-                            f'PRODUCE {order["product_id"]}에 필요한 '
-                            f'재료 {material}를 구할 수 없음'
-                        )
+                        raise RuntimeError(f'재료 {material}를 구할 수 없음')
 
-    def _assign_waste_materials(self, recycle_orders, produce_orders):
-        needed = []
+    def _find_in_stock(self, material, stock_tokens, wb_id=None, order=None):
+        candidates = [
+            token for token in stock_tokens
+            if token['raw'] == material and token['remaining'] > 0
+        ]
+        if not candidates:
+            return None
 
-        for order in produce_orders:
-            needed.extend(order['materials'])
+        if self.use_time_cost:
+            used_station_counts = Counter()
+            if order is not None:
+                for (_, source, dep, _, _) in order['material_sources']:
+                    if dep is None and isinstance(source, int):
+                        used_station_counts[source] += 1
 
-        remaining_needed = list(needed)
+            def cost(token):
+                station_id = token['station_id']
+                group_bonus = 1.5 * used_station_counts[station_id]
+                return self._travel_time(station_id, wb_id) - group_bonus
 
-        for order in recycle_orders:
-            for material in order['materials']:
-                if material in remaining_needed:
-                    order['reuse_materials'].append(material)
-                    remaining_needed.remove(material)
-                else:
-                    order['waste_materials'].append(material)
+            chosen = min(candidates, key=cost)
+        else:
+            chosen = candidates[0]
 
-    def _find_in_stock(self, material, stock):
-        for station_id, materials in stock.items():
-            if material in materials:
-                return station_id
+        chosen['remaining'] -= 1
+        return chosen['station_id'], chosen['object_id'], chosen['ref']
 
-        return None
-
-    # --------------------------------------------------------
-    # Step 5: 시간 비용 기반 WB 시퀀스 결정
-    # --------------------------------------------------------
-
-    def _build_wb_sequence(
-        self,
-        produce_orders,
-        recycle_orders,
-        station_materials,
-        station_coords,
-        wb_id,
-        customer_id,
-        storage_id
+    def _assign_waste_materials(
+        self, recycle_orders, produce_orders, waste_target_tokens,
+        fallback_storage_id, wb_id
     ):
-        recycle_after_produce_ids = {
-            ro['product_id']
-            for ro in recycle_orders
-            if ro.get('source_after_produce', False)
-        }
+        """RECYCLE 후 재료 → reuse / waste 분류 및 waste 반납 target 결정."""
+        reused_by_recycle = {id(order): [] for order in recycle_orders}
 
         for po in produce_orders:
-            po['has_following_recycle'] = po['product_id'] in recycle_after_produce_ids
+            for (material, source, dep_recycle, object_id, token_ref) in po['material_sources']:
+                if dep_recycle is not None:
+                    reused_by_recycle[id(dep_recycle)].append(material)
 
-        all_tasks = []
-        all_tasks.extend(produce_orders)
-        all_tasks.extend(recycle_orders)
+        for order in recycle_orders:
+            remaining = list(order['materials'])
+            for material in reused_by_recycle[id(order)]:
+                if material in remaining:
+                    remaining.remove(material)
+                    order['reuse_materials'].append(material)
 
-        remaining = list(all_tasks)
-        wb_sequence = []
+            order['waste_materials'] = remaining
+            order['waste_items'] = self._assign_waste_targets(
+                remaining, waste_target_tokens, fallback_storage_id, wb_id
+            )
 
-        done_recycle_ids = set()
-        done_product_ids = set()
+    def _assign_waste_targets(self, waste_materials, waste_target_tokens, fallback_storage_id, wb_id):
+        assignments = []
+        fallback_ref_base = 100000
 
-        current_station = STATION_START_GOAL
+        for i, material in enumerate(waste_materials):
+            target = self._find_waste_target(material, waste_target_tokens, wb_id)
+            if target is not None:
+                station_id, object_id, token_ref = target
+                assignments.append({
+                    'raw': material,
+                    'station_id': station_id,
+                    'object_id': object_id,
+                    'token_ref': token_ref,
+                })
+            else:
+                # target station을 찾지 못하면 첫 storage에 raw ID 그대로 반납한다.
+                assignments.append({
+                    'raw': material,
+                    'station_id': fallback_storage_id,
+                    'object_id': material,
+                    'token_ref': fallback_ref_base + i,
+                })
 
-        while remaining:
-            available = []
+        return assignments
 
-            for task in remaining:
-                if task['order_type'] == Order.OT_PRODUCE:
-                    deps = self._get_recycle_deps(task)
+    def _find_waste_target(self, material, waste_target_tokens, wb_id=None):
+        candidates = [
+            token for token in waste_target_tokens
+            if token['raw'] == material and token['remaining'] > 0
+        ]
+        if not candidates:
+            return None
 
-                    if all(id(dep) in done_recycle_ids for dep in deps):
-                        available.append(task)
+        if self.use_time_cost:
+            chosen = min(
+                candidates,
+                key=lambda token: self._travel_time(wb_id, token['station_id'])
+            )
+        else:
+            chosen = candidates[0]
 
-                elif task['order_type'] == Order.OT_RECYCLE:
-                    if task.get('source_after_produce', False):
-                        if task['product_id'] in done_product_ids:
-                            available.append(task)
-                    else:
-                        available.append(task)
+        chosen['remaining'] -= 1
+        return chosen['station_id'], chosen['object_id'], chosen['ref']
 
-            if not available:
-                self.get_logger().warn(
-                    '사용 가능한 task가 없습니다. '
-                    '의존성 순환 가능성이 있어 남은 작업 중 첫 작업을 강제 선택합니다.'
+    # --------------------------------------------------------
+    # Step 3: WB 시퀀스 결정
+    # --------------------------------------------------------
+
+    def _build_wb_sequence(self, produce_orders, recycle_orders, wb_id, customer_id):
+        """
+        1. 재고만으로 가능한 PRODUCE 먼저
+        2. RECYCLE 필요한 PRODUCE → 해당 RECYCLE과 묶어서
+        3. 독립 RECYCLE (어떤 PRODUCE와도 무관) → 마지막
+        4. PRODUCE 결과물 RECYCLE → 맨 마지막
+        """
+        produce_ids = {o['product_id'] for o in produce_orders}
+        after_recycle_ids = {
+            ro['product_id'] for ro in recycle_orders
+            if ro.get('source_after_produce', False)
+        }
+        for po in produce_orders:
+            po['has_following_recycle'] = po['product_id'] in after_recycle_ids
+
+        # 각 PRODUCE가 의존하는 RECYCLE 파악
+        produce_recycle_deps = {}
+        for po in produce_orders:
+            deps = []
+            for (material, source, dep_recycle, object_id, token_ref) in po['material_sources']:
+                if dep_recycle is not None and dep_recycle not in deps:
+                    deps.append(dep_recycle)
+            produce_recycle_deps[id(po)] = deps
+
+        after_recycles      = []
+        standalone_recycles = []
+
+        for ro in recycle_orders:
+            if ro.get('source_after_produce', False):
+                after_recycles.append(ro)
+            else:
+                is_linked = any(
+                    ro in deps for deps in produce_recycle_deps.values()
                 )
-                available = [remaining[0]]
+                if not is_linked:
+                    standalone_recycles.append(ro)
 
-            best_task = min(
-                available,
-                key=lambda task: self._estimate_task_cost(
-                    task,
-                    current_station,
-                    station_materials,
-                    station_coords,
-                    wb_id,
-                    customer_id,
-                    storage_id
+        wb_sequence   = []
+        used_recycles = set()
+
+        stock_only_produces = [
+            po for po in produce_orders if not produce_recycle_deps[id(po)]
+        ]
+        linked_produces = [
+            po for po in produce_orders if produce_recycle_deps[id(po)]
+        ]
+
+        if self.use_time_cost:
+            stock_only_produces.sort(
+                key=lambda po: self._estimate_task_cost(po, wb_id, customer_id)
+            )
+            linked_produces.sort(
+                key=lambda po: self._estimate_task_cost(po, wb_id, customer_id)
+            )
+            standalone_recycles.sort(
+                key=lambda ro: self._estimate_task_cost(ro, wb_id, customer_id)
+            )
+            after_recycles.sort(
+                key=lambda ro: self._estimate_task_cost(ro, wb_id, customer_id)
+            )
+
+        # 1. 재고만으로 가능한 PRODUCE
+        wb_sequence.extend(stock_only_produces)
+
+        # 2. RECYCLE 필요한 PRODUCE → 해당 RECYCLE과 묶음
+        for po in linked_produces:
+            deps = produce_recycle_deps[id(po)]
+            if self.use_time_cost:
+                deps.sort(key=lambda ro: self._estimate_task_cost(ro, wb_id, customer_id))
+            for ro in deps:
+                if id(ro) not in used_recycles:
+                    wb_sequence.append(ro)
+                    used_recycles.add(id(ro))
+            wb_sequence.append(po)
+
+        # 3. 독립 RECYCLE
+        wb_sequence.extend(standalone_recycles)
+
+        # 4. PRODUCE 결과물 RECYCLE
+        wb_sequence.extend(after_recycles)
+
+        if self.use_time_cost:
+            for task in wb_sequence:
+                cost = self._estimate_task_cost(task, wb_id, customer_id)
+                self.get_logger().info(
+                    f'비용 기반 선택: {self._task_label(task)} | '
+                    f'estimated_cost={cost:.2f}s'
                 )
-            )
-
-            best_cost = self._estimate_task_cost(
-                best_task,
-                current_station,
-                station_materials,
-                station_coords,
-                wb_id,
-                customer_id,
-                storage_id
-            )
-
-            self.get_logger().info(
-                f'비용 기반 선택: {self._task_label(best_task)} | '
-                f'estimated_cost={best_cost:.2f}s'
-            )
-
-            wb_sequence.append(best_task)
-            remaining.remove(best_task)
-
-            if best_task['order_type'] == Order.OT_PRODUCE:
-                done_product_ids.add(best_task['product_id'])
-
-            elif best_task['order_type'] == Order.OT_RECYCLE:
-                done_recycle_ids.add(id(best_task))
-
-            current_station = self._estimate_end_station(
-                best_task,
-                wb_id,
-                customer_id,
-                storage_id
-            )
 
         return wb_sequence
 
-    def _get_recycle_deps(self, produce_order):
-        deps = []
-
-        for _, _, dep_recycle in produce_order['material_sources']:
-            if dep_recycle is not None and dep_recycle not in deps:
-                deps.append(dep_recycle)
-
-        return deps
-
-    def _task_label(self, task):
-        if task['order_type'] == Order.OT_PRODUCE:
-            return f'PRODUCE {task["product_id"]}'
-
-        if task['order_type'] == Order.OT_RECYCLE:
-            return f'RECYCLE {task["product_id"]}'
-
-        return f'UNKNOWN {task["product_id"]}'
-
     # --------------------------------------------------------
-    # Step 6: 스텝 시퀀스 생성
+    # Step 4: 스텝 시퀀스 생성
     # --------------------------------------------------------
 
     def _generate_steps(
-        self,
-        wb_sequence,
-        station_materials,
-        station_coords,
-        wb_id,
-        customer_id,
-        storage_id
+        self, wb_sequence, station_items,
+        wb_id, customer_id, storage_id
     ):
         steps = []
         step_id = 0
         last_wb_step_id = None
 
-        # slot_1: 완성품/재활용 대상 제품 슬롯, 최대 1개
-        # slot_material: 원재료 슬롯, 최대 5개
-        slot_1 = None
-        slot_material = []
-
-        pending_loads = []
-        loaded_sources = set()
-
-        current_amr_station = STATION_START_GOAL
+        slot_1           = None
+        slot_material    = []
+        slot_token_refs  = set()
+        pending_loads    = []
+        loaded_sources   = set()  # (produce_order_id, material_index)
+        current_station  = STATION_START_GOAL
 
         for wb_task in wb_sequence:
 
             # ------------------------------------------------
-            # RECYCLE: 분해 대상 완성품 Load
+            # RECYCLE: 분해 대상은 무조건 CUSTOMER에서 Load
             # ------------------------------------------------
             if wb_task['order_type'] == Order.OT_RECYCLE:
 
-                if slot_1 is not None or slot_material:
+                if slot_1 is not None:
                     step_id, last_wb_step_id = self._flush_unload(
-                        steps,
-                        step_id,
-                        pending_loads,
-                        slot_1,
-                        slot_material,
-                        wb_id,
-                        last_wb_step_id
+                        steps, step_id, pending_loads,
+                        slot_1, slot_material, wb_id, last_wb_step_id
                     )
-
-                    current_amr_station = wb_id
-                    slot_1 = None
-                    slot_material = []
-                    pending_loads = []
+                    slot_1          = None
+                    slot_material   = []
+                    slot_token_refs = set()
+                    pending_loads   = []
 
                 if not wb_task.get('source_after_produce', False):
-                    src = self._find_in_stock(
-                        wb_task['product_id'],
-                        station_materials
-                    )
-
-                    if src is None:
-                        raise RuntimeError(
-                            f'RECYCLE 대상 product {wb_task["product_id"]}를 '
-                            '재고에서 찾을 수 없음'
-                        )
-
-                    if slot_1 is not None:
-                        raise RuntimeError(
-                            f'AMR 완성품 적재 용량 초과: '
-                            f'RECYCLE {wb_task["product_id"]}'
-                        )
-
                     steps.append(self._make_step(
-                        step_id,
-                        Step.AMR,
-                        Step.LOAD,
-                        [wb_task['product_id']],
-                        src,
-                        []
+                        step_id, Step.AMR, Step.LOAD,
+                        [wb_task['product_id']], customer_id, []
                     ))
-
                     pending_loads.append(step_id)
-                    step_id += 1
-                    current_amr_station = src
-
                     slot_1 = wb_task['product_id']
-
-                preload_by_station = self._select_preload_materials(
-                    wb_sequence=wb_sequence,
-                    loaded_sources=loaded_sources,
-                    slot_material=slot_material,
-                    preferred_sources=None
-                )
-
-                sorted_sources = self._sort_load_sources(
-                    preload_by_station,
-                    current_amr_station,
-                    station_coords
-                )
-
-                for source in sorted_sources:
-                    materials = preload_by_station[source]
-
-                    if not materials:
-                        continue
-
-                    steps.append(self._make_step(
-                        step_id,
-                        Step.AMR,
-                        Step.LOAD,
-                        materials,
-                        source,
-                        []
-                    ))
-
-                    pending_loads.append(step_id)
+                    current_station = customer_id
                     step_id += 1
-                    current_amr_station = source
+                else:
+                    # 단일 OT_LIFECYCLE order에서 생산 결과물을 WB에 그대로 두고 recycle하는 경우
+                    slot_1 = None
+
+                # 다음 PRODUCE 재료 미리 적재 (초기 재고에서 가져올 수 있는 것만)
+                preload_by_station = {}
+                for future_task in wb_sequence:
+                    if future_task['order_type'] != Order.OT_PRODUCE:
+                        continue
+                    for index, (material, source, dep, object_id, token_ref) in enumerate(
+                            future_task['material_sources']):
+                        source_key = (id(future_task), index)
+                        if dep is None \
+                                and len(slot_material) < 5 \
+                                and source_key not in loaded_sources:
+                            self._add_grouped_object(
+                                preload_by_station, source, object_id, token_ref
+                            )
+                            self._append_slot_object(
+                                slot_material, slot_token_refs, object_id, token_ref
+                            )
+                            loaded_sources.add(source_key)
+
+                ordered_sources = self._order_sources_by_travel(
+                    self._clean_grouped_objects(preload_by_station), current_station
+                )
+                for source, object_ids in ordered_sources:
+                    steps.append(self._make_step(
+                        step_id, Step.AMR, Step.LOAD,
+                        object_ids, source, []
+                    ))
+                    pending_loads.append(step_id)
+                    current_station = source
+                    step_id += 1
 
             # ------------------------------------------------
-            # PRODUCE: 원재료 Load
+            # PRODUCE: 재료 Load
             # ------------------------------------------------
             elif wb_task['order_type'] == Order.OT_PRODUCE:
 
                 needs_wb_material = any(
                     dep is not None
-                    for _, _, dep in wb_task['material_sources']
+                    for (_, _, dep, _, _) in wb_task['material_sources']
                 )
 
                 if needs_wb_material and pending_loads:
                     step_id, last_wb_step_id = self._flush_unload(
-                        steps,
-                        step_id,
-                        pending_loads,
-                        slot_1,
-                        slot_material,
-                        wb_id,
-                        last_wb_step_id
+                        steps, step_id, pending_loads,
+                        slot_1, slot_material, wb_id, last_wb_step_id
                     )
-
-                    current_amr_station = wb_id
-                    slot_1 = None
-                    slot_material = []
-                    pending_loads = []
+                    slot_1          = None
+                    slot_material   = []
+                    slot_token_refs = set()
+                    pending_loads   = []
 
                 load_by_station = {}
-
-                # 1) 현재 PRODUCE에 필요한 원재료 먼저 적재 대상으로 등록
-                for index, (material, source, dep) in enumerate(
-                    wb_task['material_sources']
-                ):
+                for index, (material, source, dep, object_id, token_ref) in enumerate(
+                        wb_task['material_sources']):
                     source_key = (id(wb_task), index)
-
                     if dep is None and source_key not in loaded_sources:
-                        if len(slot_material) >= MAX_RAW_CAPACITY:
-                            raise RuntimeError(
-                                f'AMR 원재료 적재 용량 초과: '
-                                f'PRODUCE {wb_task["product_id"]}'
-                            )
-
-                        load_by_station.setdefault(source, []).append(material)
-                        slot_material.append(material)
+                        self._add_grouped_object(
+                            load_by_station, source, object_id, token_ref
+                        )
+                        self._append_slot_object(
+                            slot_material, slot_token_refs, object_id, token_ref
+                        )
                         loaded_sources.add(source_key)
 
-                # 2) 현재 주문 때문에 이미 방문할 station을 우선해서
-                #    미래 PRODUCE 재료를 미리 적재
-                preferred_sources = set(load_by_station.keys())
-
-                preload_by_station = self._select_preload_materials(
-                    wb_sequence=wb_sequence,
-                    loaded_sources=loaded_sources,
-                    slot_material=slot_material,
-                    preferred_sources=preferred_sources
+                ordered_sources = self._order_sources_by_travel(
+                    self._clean_grouped_objects(load_by_station), current_station
                 )
-
-                # 3) 같은 station의 현재 재료와 미래 재료를 하나의 LOAD로 병합
-                load_by_station = self._merge_load_maps(
-                    load_by_station,
-                    preload_by_station
-                )
-
-                sorted_sources = self._sort_load_sources(
-                    load_by_station,
-                    current_amr_station,
-                    station_coords
-                )
-
-                for source in sorted_sources:
-                    materials = load_by_station[source]
-
-                    if not materials:
-                        continue
-
+                for source, object_ids in ordered_sources:
                     steps.append(self._make_step(
-                        step_id,
-                        Step.AMR,
-                        Step.LOAD,
-                        materials,
-                        source,
-                        []
+                        step_id, Step.AMR, Step.LOAD,
+                        object_ids, source, []
                     ))
-
                     pending_loads.append(step_id)
+                    current_station = source
                     step_id += 1
-                    current_amr_station = source
 
             # ------------------------------------------------
             # WB Unload
@@ -1056,63 +798,46 @@ class PlanningNode(Node):
 
             if all_objects:
                 unload_depends = list(pending_loads)
-
                 if last_wb_step_id is not None:
                     unload_depends.append(last_wb_step_id)
 
                 unload_step_id = step_id
-
                 steps.append(self._make_step(
-                    step_id,
-                    Step.AMR,
-                    Step.UNLOAD,
-                    all_objects,
-                    wb_id,
-                    unload_depends
+                    step_id, Step.AMR, Step.UNLOAD,
+                    all_objects, wb_id, unload_depends
                 ))
-
+                current_station = wb_id
                 step_id += 1
-                current_amr_station = wb_id
-
             else:
                 unload_step_id = None
 
             # ------------------------------------------------
-            # WB 작업 PRODUCE or RECYCLE
+            # WB 작업 (PRODUCE or RECYCLE)
             # ------------------------------------------------
-            wb_action = Step.PRODUCE \
+            wb_action  = Step.PRODUCE \
                 if wb_task['order_type'] == Order.OT_PRODUCE else Step.RECYCLE
-
+            # PRODUCE: 완성품 ID / RECYCLE: 분해 대상 ID
             wb_objects = [wb_task['product_id']]
 
             wb_depends = []
-
             if unload_step_id is not None:
                 wb_depends.append(unload_step_id)
-
             if last_wb_step_id is not None:
                 wb_depends.append(last_wb_step_id)
 
             if wb_task['order_type'] == Order.OT_PRODUCE:
-                for _, _, dep_recycle in wb_task['material_sources']:
+                for (_, _, dep_recycle, _, _) in wb_task['material_sources']:
                     if dep_recycle is not None:
                         recycle_sid = self._find_wb_recycle_step_id(
-                            steps,
-                            dep_recycle['product_id']
+                            steps, dep_recycle['product_id']
                         )
-
                         if recycle_sid is not None and recycle_sid not in wb_depends:
                             wb_depends.append(recycle_sid)
 
             steps.append(self._make_step(
-                step_id,
-                Step.WB,
-                wb_action,
-                wb_objects,
-                wb_id,
-                wb_depends
+                step_id, Step.WB, wb_action,
+                wb_objects, wb_id, wb_depends
             ))
-
             last_wb_step_id = step_id
             step_id += 1
 
@@ -1122,297 +847,320 @@ class PlanningNode(Node):
             if wb_task['order_type'] == Order.OT_PRODUCE:
                 if wb_task.get('has_following_recycle', False):
                     self.get_logger().info(
-                        f'PRODUCE {wb_task["product_id"]} 결과물은 '
-                        'lifecycle RECYCLE을 위해 WB에 유지'
+                        f'PRODUCE {wb_task["product_id"]} 결과물은 lifecycle RECYCLE을 위해 WB에 유지'
                     )
                 else:
                     load_sid = step_id
-
                     steps.append(self._make_step(
-                        step_id,
-                        Step.AMR,
-                        Step.LOAD,
-                        [wb_task['product_id']],
-                        wb_id,
-                        [last_wb_step_id]
+                        step_id, Step.AMR, Step.LOAD,
+                        [wb_task['product_id']], wb_id, [last_wb_step_id]
                     ))
-
                     step_id += 1
-                    current_amr_station = wb_id
-
                     steps.append(self._make_step(
-                        step_id,
-                        Step.AMR,
-                        Step.UNLOAD,
-                        [wb_task['product_id']],
-                        customer_id,
-                        [load_sid]
+                        step_id, Step.AMR, Step.UNLOAD,
+                        [wb_task['product_id']], customer_id, [load_sid]
                     ))
-
+                    current_station = customer_id
                     step_id += 1
-                    current_amr_station = customer_id
 
             # ------------------------------------------------
-            # RECYCLE 완료 후: 불필요 원재료 Storage 반납
+            # RECYCLE 완료 후: 불필요 재료를 target station에 반납
             # ------------------------------------------------
-            if (
-                wb_task['order_type'] == Order.OT_RECYCLE
-                and wb_task['waste_materials']
-            ):
-                if len(wb_task['waste_materials']) > MAX_RAW_CAPACITY:
-                    raise RuntimeError(
-                        f'AMR 원재료 적재 용량 초과: '
-                        f'RECYCLE waste={wb_task["waste_materials"]}'
-                    )
+            if wb_task['order_type'] == Order.OT_RECYCLE \
+                    and wb_task['waste_items']:
+                waste_by_station = self._group_waste_items_by_station(
+                    wb_task['waste_items']
+                )
+                ordered_waste_targets = self._order_sources_by_travel(
+                    waste_by_station, wb_id
+                )
+                for target_station, object_ids in ordered_waste_targets:
+                    load_sid = step_id
+                    steps.append(self._make_step(
+                        step_id, Step.AMR, Step.LOAD,
+                        object_ids, wb_id, [last_wb_step_id]
+                    ))
+                    current_station = wb_id
+                    step_id += 1
+                    steps.append(self._make_step(
+                        step_id, Step.AMR, Step.UNLOAD,
+                        object_ids, target_station, [load_sid]
+                    ))
+                    current_station = target_station
+                    step_id += 1
 
-                load_sid = step_id
-
-                steps.append(self._make_step(
-                    step_id,
-                    Step.AMR,
-                    Step.LOAD,
-                    wb_task['waste_materials'],
-                    wb_id,
-                    [last_wb_step_id]
-                ))
-
-                step_id += 1
-                current_amr_station = wb_id
-
-                steps.append(self._make_step(
-                    step_id,
-                    Step.AMR,
-                    Step.UNLOAD,
-                    wb_task['waste_materials'],
-                    storage_id,
-                    [load_sid]
-                ))
-
-                step_id += 1
-                current_amr_station = storage_id
-
-            slot_1 = None
-            slot_material = []
-            pending_loads = []
+            slot_1          = None
+            slot_material   = []
+            slot_token_refs = set()
+            pending_loads   = []
 
         # ------------------------------------------------
-        # 모든 작업 완료 후 START/GOAL 복귀
+        # 모든 작업 완료 후: AMR이 START/GOAL(00)으로 복귀
         # ------------------------------------------------
         if step_id > 0:
             last_step_id = step_id - 1
-
             steps.append(self._make_step(
-                step_id,
-                Step.AMR,
-                Step.GOAL,
-                [],
-                STATION_START_GOAL,
-                [last_step_id]
+                step_id, Step.AMR, Step.GOAL,
+                [], STATION_START_GOAL, [last_step_id]
             ))
-
             step_id += 1
 
         return steps
-
-    def _select_preload_materials(
-        self,
-        wb_sequence,
-        loaded_sources,
-        slot_material,
-        preferred_sources=None
-    ):
-        """
-        남는 원재료 적재 공간이 있으면 이후 PRODUCE에 필요한 원재료를 미리 적재한다.
-
-        핵심:
-        - 이미 현재 주문 때문에 방문할 station의 미래 재료를 우선 적재한다.
-        - 예: 현재 711 때문에 station 1을 방문한다면,
-          미래 462의 재료 6이 station 1에 있을 때 같이 싣는다.
-
-        적재 제약:
-        - 원재료 슬롯: 최대 5개
-        - 완성품 슬롯은 별도이므로 여기서 계산하지 않는다.
-        """
-
-        preferred_sources = set(preferred_sources or [])
-        preload_by_station = {}
-
-        occupied_raw = len(slot_material)
-        available_raw = MAX_RAW_CAPACITY - occupied_raw
-
-        if available_raw <= 0:
-            return preload_by_station
-
-        candidates = []
-
-        for future_task in wb_sequence:
-            if future_task['order_type'] != Order.OT_PRODUCE:
-                continue
-
-            for index, (material, source, dep) in enumerate(
-                future_task['material_sources']
-            ):
-                source_key = (id(future_task), index)
-
-                if (
-                    dep is None
-                    and isinstance(source, int)
-                    and source_key not in loaded_sources
-                ):
-                    preferred_score = 0 if source in preferred_sources else 1
-
-                    candidates.append({
-                        'preferred_score': preferred_score,
-                        'source': source,
-                        'material': material,
-                        'source_key': source_key,
-                    })
-
-        candidates.sort(
-            key=lambda c: (
-                c['preferred_score'],
-                c['source']
-            )
-        )
-
-        for c in candidates:
-            if available_raw <= 0:
-                break
-
-            source = c['source']
-            material = c['material']
-            source_key = c['source_key']
-
-            preload_by_station.setdefault(source, []).append(material)
-            slot_material.append(material)
-            loaded_sources.add(source_key)
-            available_raw -= 1
-
-        return preload_by_station
-
-    def _merge_load_maps(self, base_map, extra_map):
-        """
-        같은 station에서 가져올 현재 주문 재료와 미래 주문 재료를 병합한다.
-        """
-        merged = {}
-
-        for source, materials in base_map.items():
-            merged.setdefault(source, []).extend(materials)
-
-        for source, materials in extra_map.items():
-            merged.setdefault(source, []).extend(materials)
-
-        return merged
-
-    def _sort_load_sources(self, load_by_station, current_station, station_coords):
-        sources = list(load_by_station.keys())
-
-        return sorted(
-            sources,
-            key=lambda sid: (
-                self._move_time_between(current_station, sid, station_coords),
-                -len(load_by_station[sid])
-            )
-        )
 
     # --------------------------------------------------------
     # 헬퍼 함수
     # --------------------------------------------------------
 
+    def _station_coord(self, station_id):
+        if station_id in self.station_coords:
+            return self.station_coords[station_id]
+        # 좌표가 없는 station은 id를 x좌표로 둔 fallback을 사용한다.
+        return (float(station_id), 0.0)
+
+    def _travel_distance(self, from_station, to_station):
+        if from_station is None or to_station is None:
+            return 0.0
+        if from_station == to_station:
+            return 0.0
+        x1, y1 = self._station_coord(from_station)
+        x2, y2 = self._station_coord(to_station)
+        return math.hypot(x2 - x1, y2 - y1)
+
+    def _travel_time(self, from_station, to_station):
+        if not self.use_time_cost:
+            return 0.0
+        if from_station is None or to_station is None or from_station == to_station:
+            return 0.0
+        speed = max(self.amr_speed_mps, 1e-6)
+        return self._travel_distance(from_station, to_station) / speed
+
+    def _order_sources_by_travel(self, grouped, start_station):
+        if not grouped:
+            return []
+        remaining = list(grouped.items())
+        if not self.use_time_cost:
+            return remaining
+
+        ordered = []
+        current = start_station
+        while remaining:
+            idx, item = min(
+                enumerate(remaining),
+                key=lambda pair: self._travel_time(current, pair[1][0])
+            )
+            station_id, object_ids = item
+            ordered.append((station_id, object_ids))
+            current = station_id
+            remaining.pop(idx)
+        return ordered
+
+    def _select_workbench_by_cost(self, workbench_ids, station_items, customer_id):
+        if not self.use_time_cost:
+            if MAIN_WORKBENCH_STATION_ID in workbench_ids:
+                return MAIN_WORKBENCH_STATION_ID
+            return workbench_ids[0]
+
+        scores = []
+        for wb_id in workbench_ids:
+            score = self._travel_time(STATION_START_GOAL, wb_id)
+            if customer_id is not None:
+                score += self._travel_time(customer_id, wb_id)
+                score += self._travel_time(wb_id, customer_id)
+            for station_id, object_ids in station_items.items():
+                # workbench/customer 자체 material은 source station 후보에서 제외한다.
+                if station_id == wb_id or station_id == customer_id:
+                    continue
+                raw_count = 0
+                for object_id in object_ids:
+                    raw, count = self._decode_station_object(object_id)
+                    if raw is not None:
+                        raw_count += max(1, count)
+                if raw_count:
+                    score += raw_count * self._travel_time(station_id, wb_id)
+            scores.append((score, wb_id))
+
+        scores.sort()
+        chosen_score, chosen_wb = scores[0]
+        self.get_logger().info(
+            f'[COST] selected workbench={chosen_wb} estimated_score={chosen_score:.2f}'
+        )
+        return chosen_wb
+
+    def _estimate_task_cost(self, task, wb_id, customer_id):
+        """원래 planner의 시간 비용 항목을 유지한 간단 추정값."""
+        process_cost = self._process_cost(task)
+
+        if task['order_type'] == Order.OT_RECYCLE:
+            # 별도 OT_RECYCLE은 CUSTOMER에서 완성품을 가져온다고 가정한다.
+            if task.get('source_after_produce', False):
+                collect_cost = 0.0
+            else:
+                collect_cost = (
+                    self._travel_time(customer_id, wb_id)
+                    + VISION_TIME_AVG
+                    + LOAD_TIME
+                    + UNLOAD_TIME
+                )
+
+            waste_items = task.get('waste_items', [])
+            waste_by_station = self._group_waste_items_by_station(waste_items)
+            waste_cost = 0.0
+            current = wb_id
+            for target_station, object_ids in self._order_sources_by_travel(
+                    waste_by_station, wb_id):
+                n_items = len(object_ids)
+                waste_cost += (
+                    self._travel_time(current, target_station)
+                    + n_items * LOAD_TIME
+                    + n_items * UNLOAD_TIME
+                )
+                current = target_station
+
+            return collect_cost + process_cost + waste_cost
+
+        if task['order_type'] == Order.OT_PRODUCE:
+            source_to_objects = {}
+            for (_, source, dep_recycle, object_id, token_ref) in task.get('material_sources', []):
+                if dep_recycle is not None or not isinstance(source, int):
+                    continue
+                self._add_grouped_object(source_to_objects, source, object_id, token_ref)
+
+            collect_cost = 0.0
+            current = STATION_START_GOAL
+            for source, object_ids in self._order_sources_by_travel(
+                    self._clean_grouped_objects(source_to_objects), current):
+                n_items = len(object_ids)
+                collect_cost += (
+                    self._travel_time(current, source)
+                    + VISION_TIME_AVG
+                    + n_items * LOAD_TIME
+                )
+                current = source
+
+            if source_to_objects:
+                total_objects = sum(
+                    len(v) for k, v in source_to_objects.items()
+                    if not isinstance(k, tuple)
+                )
+                collect_cost += self._travel_time(current, wb_id)
+                collect_cost += total_objects * UNLOAD_TIME
+
+            deliver_cost = 0.0
+            if customer_id is not None:
+                deliver_cost = (
+                    self._travel_time(wb_id, customer_id)
+                    + LOAD_TIME
+                    + UNLOAD_TIME
+                )
+
+            return collect_cost + process_cost + deliver_cost
+
+        return float('inf')
+
+    def _process_cost(self, task):
+        n = len(task.get('materials', []))
+        if task['order_type'] == Order.OT_PRODUCE:
+            return max(0, n - 1) * ASSEMBLY_PAIR_TIME
+        if task['order_type'] == Order.OT_RECYCLE:
+            return max(0, n - 1) * DISASSEMBLY_PAIR_TIME
+        return 0.0
+
     def _make_step(self, step_id, type_, action, object_ids, station_id, depends_on):
         step = Step()
-
-        step.step_id = step_id
-        step.type = type_
-        step.action = action
+        step.step_id    = step_id
+        step.type       = type_
+        step.action     = action
         step.object_ids = list(object_ids)
         step.station_id = station_id if station_id is not None else -1
         step.depends_on = list(depends_on)
-
         return step
 
+    def _add_grouped_object(self, grouped, station_id, object_id, token_ref):
+        """같은 batch token은 한 번만 싣고, raw 중복은 서로 다른 token이면 중복 허용."""
+        items = grouped.setdefault(station_id, [])
+        refs = grouped.setdefault((station_id, '_refs'), set())
+        if token_ref is not None:
+            if token_ref in refs:
+                return
+            refs.add(token_ref)
+        items.append(object_id)
+
+    def _clean_grouped_objects(self, grouped):
+        return {k: v for k, v in grouped.items() if not isinstance(k, tuple)}
+
+    def _append_slot_object(self, slot_objects, slot_token_refs, object_id, token_ref):
+        if token_ref is not None:
+            if token_ref in slot_token_refs:
+                return
+            slot_token_refs.add(token_ref)
+        slot_objects.append(object_id)
+
+    def _group_waste_items_by_station(self, waste_items):
+        grouped = {}
+        seen_refs = set()
+        for item in waste_items:
+            station_id = item['station_id']
+            token_ref = item['token_ref']
+            object_id = item['object_id']
+            key = (station_id, token_ref)
+            if key in seen_refs:
+                continue
+            seen_refs.add(key)
+            grouped.setdefault(station_id, []).append(object_id)
+        return grouped
+
     def _flush_unload(
-        self,
-        steps,
-        step_id,
-        pending_loads,
-        slot_1,
-        slot_material,
-        wb_id,
-        last_wb_step_id
+        self, steps, step_id, pending_loads,
+        slot_1, slot_material, wb_id, last_wb_step_id
     ):
         unload_depends = list(pending_loads)
-
         if last_wb_step_id is not None:
             unload_depends.append(last_wb_step_id)
-
-        all_objects = (
-            ([slot_1] if slot_1 is not None else []) + slot_material
-        )
-
-        if all_objects:
-            steps.append(self._make_step(
-                step_id,
-                Step.AMR,
-                Step.UNLOAD,
-                all_objects,
-                wb_id,
-                unload_depends
-            ))
-
-            step_id += 1
-
-        return step_id, last_wb_step_id
+        all_objects = (([slot_1] if slot_1 is not None else []) + slot_material)
+        steps.append(self._make_step(
+            step_id, Step.AMR, Step.UNLOAD,
+            all_objects, wb_id, unload_depends
+        ))
+        return step_id + 1, last_wb_step_id
 
     def _find_wb_recycle_step_id(self, steps, product_id):
         for step in steps:
             if step.type == Step.WB and step.action == Step.RECYCLE:
                 if product_id in step.object_ids:
                     return step.step_id
-
         return None
 
     # --------------------------------------------------------
     # 로그
     # --------------------------------------------------------
 
-    def _log_cost_summary(
-        self,
-        wb_sequence,
-        station_materials,
-        station_coords,
-        wb_id,
-        customer_id,
-        storage_id
-    ):
+    def _task_label(self, task):
+        if task['order_type'] == Order.OT_PRODUCE:
+            return f'PRODUCE {task["product_id"]}'
+        if task['order_type'] == Order.OT_RECYCLE:
+            return f'RECYCLE {task["product_id"]}'
+        return f'UNKNOWN {task["product_id"]}'
+
+    def _log_cost_summary(self, wb_sequence, wb_id, customer_id):
         self.get_logger().info('===== 시간 비용 기반 WB 작업 순서 =====')
 
-        current_station = STATION_START_GOAL
-
         for index, task in enumerate(wb_sequence):
-            cost = self._estimate_task_cost(
-                task,
-                current_station,
-                station_materials,
-                station_coords,
-                wb_id,
-                customer_id,
-                storage_id
-            )
-
+            cost = self._estimate_task_cost(task, wb_id, customer_id)
             self.get_logger().info(
                 f'{index + 1}. {self._task_label(task)} | '
                 f'estimated_cost={cost:.2f}s'
             )
 
-            current_station = self._estimate_end_station(
-                task,
-                wb_id,
-                customer_id,
-                storage_id
-            )
-
         self.get_logger().info('===================================')
+
+    def _log_material_model(self, model):
+        self.get_logger().info('===== lifecycle material model =====')
+        self.get_logger().info(f'P produce_materials : {model["produce_materials"]}')
+        self.get_logger().info(f'R recycle_materials : {model["recycle_materials"]}')
+        self.get_logger().info(f'C common_reuse      : {model["common_reuse"]}')
+        self.get_logger().info(f'P-C initial         : {model["produce_initial"]}')
+        self.get_logger().info(f'R-C leftover        : {model["recycle_leftover"]}')
+        self.get_logger().info('====================================')
 
     def _log_plan_summary(self, produce_orders, recycle_orders):
         def name(pid):
@@ -1420,107 +1168,77 @@ class PlanningNode(Node):
 
         self.get_logger().info('===== 실행 계획 요약 =====')
 
-        self.get_logger().info(
-            f'AMR 적재 제약: 원재료 최대 {MAX_RAW_CAPACITY}개, '
-            f'완성품 최대 {MAX_PRODUCT_CAPACITY}개'
-        )
-
         for order in recycle_orders:
             pid = order['product_id']
-
             self.get_logger().info(f'[RECYCLE] {pid} ({name(pid)})')
+            self.get_logger().info(f'  -> CUSTOMER에서 완성품 LOAD 가정')
             self.get_logger().info(f'  -> 분해 후: {order["materials"]}')
-
-            if order.get('source_after_produce', False):
-                self.get_logger().info(
-                    '  -> source : PRODUCE 결과물을 WB에서 바로 RECYCLE'
-                )
-
             if order['reuse_materials']:
                 reuse_info = []
                 reuse_remaining = list(order['reuse_materials'])
-
                 for po in produce_orders:
-                    for material, source, dep_recycle in po['material_sources']:
+                    for (material, source, dep_recycle, object_id, token_ref) in po['material_sources']:
                         if dep_recycle is order and material in reuse_remaining:
                             reuse_remaining.remove(material)
                             reuse_info.append(
                                 f'{material} -> PRODUCE {po["product_id"]}'
                             )
-
                 self.get_logger().info(
-                    f'  -> reuse : {order["reuse_materials"]}  '
-                    f'({" / ".join(reuse_info)})'
+                    f'  -> reuse : {order["reuse_materials"]}  ({" / ".join(reuse_info)})'
                 )
-
             if order['waste_materials']:
+                waste_targets = [
+                    f'{item["object_id"]}->station {item["station_id"]}'
+                    for item in order['waste_items']
+                ]
                 self.get_logger().info(
-                    f'  -> waste : {order["waste_materials"]}  -> Storage 반납'
+                    f'  -> waste : {order["waste_materials"]}  ({" / ".join(waste_targets)})'
                 )
 
         for order in produce_orders:
             pid = order['product_id']
-
             self.get_logger().info(f'[PRODUCE] {pid} ({name(pid)})')
             self.get_logger().info(f'  -> 재료: {order["materials"]}')
-
-            if order.get('has_following_recycle', False):
-                self.get_logger().info(
-                    '  -> lifecycle : 생산 후 고객 납품 없이 WB에서 RECYCLE 예정'
-                )
-
-            for material, source, dep_recycle in order['material_sources']:
+            for (material, source, dep_recycle, object_id, token_ref) in order['material_sources']:
                 if dep_recycle is not None:
                     self.get_logger().info(
-                        f'  -> {material} : RECYCLE '
-                        f'{dep_recycle["product_id"]} 후 WB에서 재사용'
+                        f'  -> {material} : RECYCLE {dep_recycle["product_id"]} 후 WB에서 재사용'
                     )
                 else:
                     self.get_logger().info(
-                        f'  -> {material} : station={source} 에서 Load'
+                        f'  -> {material} : station={source} 에서 object_id={object_id} Load'
                     )
 
         self.get_logger().info('==========================')
 
     def _log_steps(self, steps):
-        type_map = {
-            Step.AMR: 'AMR',
-            Step.WB: 'WB ',
-        }
-
+        type_map   = {Step.AMR: 'AMR', Step.WB: 'WB '}
         action_map = {
-            Step.LOAD: 'LOAD   ',
-            Step.UNLOAD: 'UNLOAD ',
+            Step.LOAD:    'LOAD   ',
+            Step.UNLOAD:  'UNLOAD ',
             Step.PRODUCE: 'PRODUCE',
             Step.RECYCLE: 'RECYCLE',
-            Step.GOAL: 'GOAL   ',
+            Step.GOAL:    'GOAL   ',
         }
-
         self.get_logger().info('===== 스텝 시퀀스 =====')
-
         for s in steps:
             self.get_logger().info(
-                f'[{s.step_id:2d}] {type_map.get(s.type, str(s.type))} | '
-                f'{action_map.get(s.action, str(s.action))} | '
+                f'[{s.step_id:2d}] {type_map[s.type]} | '
+                f'{action_map[s.action]} | '
                 f'objects={list(s.object_ids)} | '
                 f'station={s.station_id} | '
                 f'depends_on={list(s.depends_on)}'
             )
-
         self.get_logger().info('======================')
 
 
 def main(args=None):
     rclpy.init(args=args)
-
     node = PlanningNode()
-
     try:
         rclpy.spin(node)
-
     except KeyboardInterrupt:
         pass
-
     finally:
         node.destroy_node()
         rclpy.shutdown()

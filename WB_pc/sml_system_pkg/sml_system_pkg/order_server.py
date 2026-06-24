@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
-import math
 import random
+from collections import Counter
+
 import rclpy
 from rclpy.node import Node
 from sml_msgs.msg import Task, Order, Station
@@ -11,7 +12,7 @@ from sml_msgs.msg import Task, Order, Station
 ST_STORAGE   = Station.ST_STORAGE
 ST_WORKBENCH = Station.ST_WORKBENCH
 ST_CUSTOMER  = Station.ST_CUSTOMER
-ST_HYBRID    = Station.ST_HYBRID   # 메시지 정의는 유지하지만 더 이상 사용하지 않음 (아레나에 Hybrid 없음)
+ST_HYBRID    = Station.ST_HYBRID
 
 # Order Type
 OT_PRODUCE = Order.OT_PRODUCE
@@ -119,16 +120,7 @@ class OrderServer(Node):
         # ── 자동 설정 ──────────────────────────────────────────
         self.produce_count = self.config['orders']
         self.recycle_count = self.config['returns']
-
-        # 아레나가 고정되었으므로 station_count는 더 이상 동적 계산하지 않음
         self.station_count = STATION_COUNT
-
-        # 개별 블록 사용 (배치 컨테이너 없음)
-        self.use_batches = False
-
-        # Lifecycle이면 분해된 원자재를 창고에 재배치 (재사용)
-        # Recycling이면 반납만 하고 끝
-        self.recycled_to_storage = (self.stage == 'lifecycle')
 
         # 항상 랜덤 선택
         self.random_order = True
@@ -136,6 +128,11 @@ class OrderServer(Node):
         # 오더 수가 제품 종류(11개)를 초과하면 자동으로 중복 허용
         total_count = self.produce_count + self.recycle_count
         self.allow_duplicate = total_count > len(PRODUCT_DB)
+
+        # 출력/검증용 메타 정보
+        self.lifecycle_common_materials = []
+        self.produce_initial_materials = []
+        self.recycle_leftover_materials = []
 
         # ── Task 생성 + 원자재 수 검증 ─────────────────────────
         self.task, self.arena_layout = self._generate_with_validation()
@@ -155,12 +152,8 @@ class OrderServer(Node):
         total_raw = 0
         for order in task.order_list:
             _, material_ids = PRODUCT_DB[order.product_id]
-            if order.order_type == OT_PRODUCE:
-                total_raw += len(material_ids)
-            elif order.order_type == OT_RECYCLE:
-                # 분해로 발생하는 원자재 총량은 recycled_to_storage(창고 재배치 여부)와
-                # 무관하게 항상 검증 대상에 포함한다 (raw_mat는 "발생량" 기준).
-                total_raw += len(material_ids)
+            # raw_mat는 생산 필요량 + 재활용 분해 발생량 기준으로 계산한다.
+            total_raw += len(material_ids)
 
         low  = raw_target - raw_variance
         high = raw_target + raw_variance
@@ -229,8 +222,66 @@ class OrderServer(Node):
         return produce_ids, recycle_ids
 
     # ──────────────────────────────────────────────────────────
-    # 재료 분배
+    # 재료 계산 / batch 처리
     # ──────────────────────────────────────────────────────────
+
+    def _materials_from_products(self, product_ids):
+        materials = []
+        for pid in product_ids:
+            _, material_ids = PRODUCT_DB[pid]
+            materials.extend(material_ids)
+        return materials
+
+    def _multiset_common_preserve_order(self, left, right):
+        """중복 개수를 보존한 교집합. 순서는 left 기준."""
+        right_count = Counter(right)
+        common = []
+        for item in left:
+            if right_count[item] > 0:
+                common.append(item)
+                right_count[item] -= 1
+        return common
+
+    def _subtract_preserve_order(self, base, remove):
+        """base에서 remove를 중복 개수만큼 제거. 순서는 base 기준."""
+        remove_count = Counter(remove)
+        result = []
+        for item in base:
+            if remove_count[item] > 0:
+                remove_count[item] -= 1
+            else:
+                result.append(item)
+        return result
+
+    def _build_storage_material_list(self, produce_ids, recycle_ids):
+        """
+        우리가 정한 lifecycle 생성 규칙.
+
+        P = PRODUCE 필요 원재료
+        R = RECYCLE 분해 결과 원재료
+        C = P와 R의 공통 원재료(중복 개수 보존)
+
+        station 배치 목록 = (P - C) + (R - C)
+        CUSTOMER 배치 목록 = RECYCLE product_id
+
+        production-only: C 없음 → P 배치
+        recycling-only : C 없음 → R 배치(재활용 후 배치 대상)
+        lifecycle      : 공통 C는 재활용 후 생산에 바로 재사용할 예약 재료라서 station에 배치하지 않음
+        """
+        produce_materials = self._materials_from_products(produce_ids)
+        recycle_materials = self._materials_from_products(recycle_ids)
+
+        common = self._multiset_common_preserve_order(
+            produce_materials, recycle_materials
+        )
+        produce_initial = self._subtract_preserve_order(produce_materials, common)
+        recycle_leftover = self._subtract_preserve_order(recycle_materials, common)
+
+        self.lifecycle_common_materials = common
+        self.produce_initial_materials = produce_initial
+        self.recycle_leftover_materials = recycle_leftover
+
+        return produce_initial + recycle_leftover
 
     def split_materials(self, materials, storage_count):
         buckets = [[] for _ in range(storage_count)]
@@ -239,6 +290,36 @@ class OrderServer(Node):
         for i, material in enumerate(materials):
             buckets[i % storage_count].append(material)
         return buckets
+
+    def _apply_station_batch_ids(self, materials):
+        """
+        station 내부에서 같은 raw material이 2개 이상이면 batch ID로 압축한다.
+
+        예: [8, 1, 8] -> [80, 1]
+            [4, 4, 4] -> [40, 4]
+            [4, 4, 4, 4] -> [40, 40]
+
+        product 분해 단계에서 batch화하지 않고, station 배치가 끝난 뒤에만 적용한다.
+        """
+        counts = Counter(materials)
+        used = set()
+        result = []
+
+        for material in materials:
+            if material in used:
+                continue
+            used.add(material)
+
+            count = counts[material]
+            if material in RAW_TO_BATCH and count >= 2:
+                pair_count = count // 2
+                result.extend([RAW_TO_BATCH[material]] * pair_count)
+                if count % 2:
+                    result.append(material)
+            else:
+                result.extend([material] * count)
+
+        return result
 
     # ──────────────────────────────────────────────────────────
     # Task 생성
@@ -260,18 +341,8 @@ class OrderServer(Node):
             order.product_id = pid
             task.order_list.append(order)
 
-        storage_materials = []
-        customer_products = []
-
-        for order in task.order_list:
-            _, material_ids = PRODUCT_DB[order.product_id]
-
-            if order.order_type == OT_PRODUCE:
-                storage_materials.extend(material_ids)
-            elif order.order_type == OT_RECYCLE:
-                customer_products.append(order.product_id)
-                if self.recycled_to_storage:
-                    storage_materials.extend(material_ids)
+        storage_materials = self._build_storage_material_list(produce_ids, recycle_ids)
+        customer_products = list(recycle_ids)
 
         # 고정 아레나 배치: STATION_LAYOUT 기준으로 station_id/타입을 그대로 사용
         storage_buckets = self.split_materials(
@@ -285,11 +356,13 @@ class OrderServer(Node):
             station_type = STATION_LAYOUT[station_id]
 
             if station_type == ST_STORAGE:
-                material_ids = storage_buckets[storage_index]
+                material_ids = self._apply_station_batch_ids(
+                    storage_buckets[storage_index]
+                )
                 storage_index += 1
             elif station_type == ST_CUSTOMER:
                 material_ids = customer_products
-            else:  # ST_WORKBENCH
+            else:  # ST_WORKBENCH / ST_HYBRID
                 material_ids = []
 
             arena_layout.append({
@@ -324,6 +397,10 @@ class OrderServer(Node):
         print(f'# recycle_count   = {self.recycle_count}')
         print(f'# raw_materials   = {total_raw}  (목표: {raw_target}±{raw_variance})')
         print(f'# station_count   = {self.station_count} (고정)')
+        if self.produce_count and self.recycle_count:
+            print(f'# lifecycle_common(reuse)   = {self.lifecycle_common_materials}')
+            print(f'# produce_initial_materials = {self.produce_initial_materials}')
+            print(f'# recycle_leftover_materials= {self.recycle_leftover_materials}')
         print()
 
         print('order_list = ')
