@@ -1,0 +1,11 @@
+# GetPlan.srv
+
+# Request (ManagerNode → PlanningNode)
+# 요청 자체가 신호 — 비어있음
+
+---
+
+# Response (PlanningNode → ManagerNode)
+sml_msgs/Step[] steps
+bool            success
+string          message

@@ -1,0 +1,9 @@
+# Goal
+int32  station_id
+---
+# Result
+bool   success
+string fail_reason
+---
+# Feedback
+string status
