@@ -1,7 +1,5 @@
 ## ▶️ 실행 방법
 
-본 시스템은 두 가지 방식으로 테스트할 수 있습니다.
-
 * **Case 1. 자체 모의 테스트**
   우리가 만든 `order_server`가 `/sml/task`를 직접 발행하고, `sml_planning_node`와 `sml_manager_node`가 이를 받아 전체 흐름을 테스트합니다.
 
