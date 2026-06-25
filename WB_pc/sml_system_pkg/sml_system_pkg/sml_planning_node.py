@@ -5,12 +5,9 @@ ManagerNode 요청 시 전달하는 노드.
 
 반영된 규칙
 1. batch ID 해석
-   - 10,20,...,80은 각각 raw 1,2,...,8 batch로 취급한다.
-   - 공식 정의에 따라 일반 batch는 최소 5개 raw material piece를 포함한다고 보고,
-     planner 내부에서는 해당 raw 5개로 확장한다.
-   - 90은 mixed batch로 취급하고, 일반 단품/일반 batch/recycle 결과로도 부족한 raw가 있으면
-     그 부족분이 90 안에 있다고 가정한다.
-   - AMR LOAD/UNLOAD object_ids에는 batch ID가 아니라 실제 로봇팔이 집을 raw ID를 넣는다.
+   - 10,20,...,80은 각각 raw 1,2,...,8을 BATCH_SIZE개 담은 batch로 취급한다.
+   - planner 내부 재고 계산에는 batch capacity를 사용한다.
+   - AMR LOAD/UNLOAD object_ids에는 batch ID가 아니라 raw ID로 분해해서 넣는다.
 
 2. RECYCLE source 규칙
    - Order.OT_RECYCLE product_id는 무조건 CUSTOMER station에 있다고 가정한다.
@@ -60,9 +57,7 @@ RAW_TO_BATCH = {
     8: 80,
 }
 BATCH_TO_RAW = {batch: raw for raw, batch in RAW_TO_BATCH.items()}
-BATCH_SIZE = 5  # 공식 정의: 일반 batch는 최소 raw material piece 5개
-MIXED_BATCH = 90
-MIXED_BATCH_CAPACITY = 10 ** 6  # mixed batch는 부족분 전체를 수용한다고 가정
+BATCH_SIZE = 5
 
 # --------------------------------------------------------
 # 경기 / 시스템 시간 가정값
@@ -104,8 +99,6 @@ class PlanningNode(Node):
 
         self.plan_generated = False
         self.steps = []
-        self._token_info = {}
-        self._station_tokens_by_station = {}
 
         self.declare_parameter('task_topic', '/sml/task')
         self.declare_parameter('use_time_cost', True)
@@ -188,7 +181,6 @@ class PlanningNode(Node):
             )
 
             self.get_logger().info(f'계획 생성 완료: {len(self.steps)}개 스텝')
-            self._log_station_expected(station_items, produce_orders, recycle_orders)
             self._log_cost_summary(wb_sequence, wb_id, customer_id)
             self._log_material_model(material_model)
             self._log_plan_summary(produce_orders, recycle_orders)
@@ -373,15 +365,12 @@ class PlanningNode(Node):
         stock_tokens = []
         waste_target_tokens = []
         token_ref = 0
-        self._token_info = {}
-        self._station_tokens_by_station = {}
 
         initial_counts = Counter(material_model['produce_initial_counts'])
         waste_counts = Counter(material_model['recycle_leftover_counts'])
 
         for station in arena_layout:
             station_items[station.station_id] = list(station.material_ids)
-            self._station_tokens_by_station.setdefault(station.station_id, [])
 
             if station.station_type == Station.ST_WORKBENCH:
                 workbench_ids.append(station.station_id)
@@ -395,7 +384,7 @@ class PlanningNode(Node):
                 continue
 
             for object_id in station.material_ids:
-                raw, raw_count, is_batch = self._decode_station_object(object_id)
+                raw, raw_count = self._decode_station_object(object_id)
                 if raw is None:
                     continue
 
@@ -406,27 +395,17 @@ class PlanningNode(Node):
                     'raw': raw,
                     'capacity': raw_count,
                     'remaining': raw_count,
-                    'is_batch': is_batch,
                 }
-                self._token_info[token_ref] = token
-                self._station_tokens_by_station[station.station_id].append(token)
                 token_ref += 1
 
                 # lifecycle 생성 규칙을 역추론한다.
                 # P-C에 해당하는 raw는 초기 생산 재료(stock), R-C는 recycle leftover target.
-                # batch는 내부 수량을 확정하지 않고, 해당 raw의 남은 부족분 전체를 수용한다고 가정한다.
                 if initial_counts[raw] > 0:
                     stock_tokens.append(token)
-                    if is_batch:
-                        initial_counts[raw] = 0
-                    else:
-                        initial_counts[raw] -= raw_count
+                    initial_counts[raw] -= raw_count
                 elif waste_counts[raw] > 0:
                     waste_target_tokens.append(token)
-                    if is_batch:
-                        waste_counts[raw] = 0
-                    else:
-                        waste_counts[raw] -= raw_count
+                    waste_counts[raw] -= raw_count
                 else:
                     # 공식 예시나 수동 task에서 모델과 맞지 않는 재료가 들어온 경우,
                     # 생산 재료로 사용할 수 있도록 stock으로 둔다.
@@ -447,21 +426,13 @@ class PlanningNode(Node):
         return station_items, stock_tokens, waste_target_tokens, wb_id, customer_id, storage_id
 
     def _decode_station_object(self, object_id):
-        """station material_id를 raw 단위로 해석한다.
-
-        반환값: (raw_id, capacity, is_batch)
-        - 일반 batch 10~80은 해당 raw_id 5개로 확장한다.
-        - mixed batch 90은 raw_id가 특정되지 않는 wildcard source로 둔다.
-        - 단, AMR/ARM 명령에는 batch ID가 아니라 raw_id를 넣는다.
-        """
+        """station material_id를 raw 단위로 해석한다."""
         if object_id in BATCH_TO_RAW:
-            return BATCH_TO_RAW[object_id], BATCH_SIZE, True
-        if object_id == MIXED_BATCH:
-            return 'MIXED', MIXED_BATCH_CAPACITY, True
+            return BATCH_TO_RAW[object_id], BATCH_SIZE
         if 1 <= object_id <= 8:
-            return object_id, 1, False
+            return object_id, 1
         # product_id 등은 raw stock으로 보지 않음
-        return None, 0, False
+        return None, 0
 
     # --------------------------------------------------------
     # Step 2: 재료 출처 분류 + 가상 차감
@@ -505,29 +476,10 @@ class PlanningNode(Node):
                         raise RuntimeError(f'재료 {material}를 구할 수 없음')
 
     def _find_in_stock(self, material, stock_tokens, wb_id=None, order=None):
-        # 1순위: 같은 raw_id의 단품 / 일반 batch(10~80)
-        exact_candidates = [
+        candidates = [
             token for token in stock_tokens
             if token['raw'] == material and token['remaining'] > 0
         ]
-
-        # 단품 raw가 있으면 단품을 먼저 사용한다.
-        # 단품으로 부족할 때 일반 batch를 사용한다.
-        single_candidates = [t for t in exact_candidates if not t.get('is_batch', False)]
-        batch_candidates = [t for t in exact_candidates if t.get('is_batch', False)]
-
-        if single_candidates:
-            candidates = single_candidates
-        elif batch_candidates:
-            candidates = batch_candidates
-        else:
-            # 마지막 fallback: mixed batch 90.
-            # 90은 특정 raw로 고정 분해하지 않고, 부족 raw가 그 안에 있다고 가정한다.
-            candidates = [
-                token for token in stock_tokens
-                if token['raw'] == 'MIXED' and token['remaining'] > 0
-            ]
-
         if not candidates:
             return None
 
@@ -541,19 +493,22 @@ class PlanningNode(Node):
             def cost(token):
                 station_id = token['station_id']
                 group_bonus = 1.5 * used_station_counts[station_id]
-                # 같은 raw 전용 source를 mixed보다 우선한다.
-                mixed_penalty = 5.0 if token['raw'] == 'MIXED' else 0.0
-                return self._travel_time(station_id, wb_id) - group_bonus + mixed_penalty
+                return self._travel_time(station_id, wb_id) - group_bonus
 
             chosen = min(candidates, key=cost)
         else:
             chosen = candidates[0]
 
+        # AMR/ARM에는 batch ID(10,20,...,80)를 그대로 보내지 않는다.
+        # batch token 하나가 여러 raw를 담고 있으면, 필요한 개수만큼 raw ID로 분해해서 보낸다.
+        # 예: object_id=40, BATCH_SIZE=5인 token에서 raw 4를 두 번 쓰면
+        #     AMR step object_ids에는 [4, 4]가 들어간다.
+        use_index = chosen['capacity'] - chosen['remaining']
         chosen['remaining'] -= 1
 
-        # batch/mixed에서 꺼내더라도 로봇팔 명령은 raw ID로 보낸다.
-        command_object_id = material
-        return chosen['station_id'], command_object_id, chosen['ref']
+        amr_object_id = material
+        raw_token_ref = (chosen['ref'], use_index)
+        return chosen['station_id'], amr_object_id, raw_token_ref
 
     def _assign_waste_materials(
         self, recycle_orders, produce_orders, waste_target_tokens,
@@ -605,38 +560,28 @@ class PlanningNode(Node):
         return assignments
 
     def _find_waste_target(self, material, waste_target_tokens, wb_id=None):
-        exact_candidates = [
+        candidates = [
             token for token in waste_target_tokens
             if token['raw'] == material and token['remaining'] > 0
         ]
-
-        single_candidates = [t for t in exact_candidates if not t.get('is_batch', False)]
-        batch_candidates = [t for t in exact_candidates if t.get('is_batch', False)]
-
-        if single_candidates:
-            candidates = single_candidates
-        elif batch_candidates:
-            candidates = batch_candidates
-        else:
-            candidates = [
-                token for token in waste_target_tokens
-                if token['raw'] == 'MIXED' and token['remaining'] > 0
-            ]
-
         if not candidates:
             return None
 
         if self.use_time_cost:
             chosen = min(
                 candidates,
-                key=lambda token: self._travel_time(wb_id, token['station_id']) + (5.0 if token['raw'] == 'MIXED' else 0.0)
+                key=lambda token: self._travel_time(wb_id, token['station_id'])
             )
         else:
             chosen = candidates[0]
 
+        # Waste target도 batch ID가 아니라 실제 raw ID로 반납하도록 step을 만든다.
+        use_index = chosen['capacity'] - chosen['remaining']
         chosen['remaining'] -= 1
-        command_object_id = material
-        return chosen['station_id'], command_object_id, chosen['ref']
+
+        amr_object_id = material
+        raw_token_ref = (chosen['ref'], use_index)
+        return chosen['station_id'], amr_object_id, raw_token_ref
 
     # --------------------------------------------------------
     # Step 3: WB 시퀀스 결정
@@ -1041,9 +986,9 @@ class PlanningNode(Node):
                     continue
                 raw_count = 0
                 for object_id in object_ids:
-                    raw, count, is_batch = self._decode_station_object(object_id)
+                    raw, count = self._decode_station_object(object_id)
                     if raw is not None:
-                        raw_count += BATCH_SIZE if is_batch else 1
+                        raw_count += max(1, count)
                 if raw_count:
                     score += raw_count * self._travel_time(station_id, wb_id)
             scores.append((score, wb_id))
@@ -1145,25 +1090,36 @@ class PlanningNode(Node):
         return step
 
     def _add_grouped_object(self, grouped, station_id, object_id, token_ref):
-        """LOAD 명령에는 실제 로봇팔이 집을 raw/product ID를 그대로 추가한다.
-
-        batch token에서 여러 raw를 꺼내는 경우에도 object_id는 raw ID로 중복되어야 한다.
-        예: station material_ids=[40,2], PRODUCE 442 -> LOAD [4,4,2]
-        """
-        grouped.setdefault(station_id, []).append(object_id)
+        """같은 raw 사용 token은 중복 방지하고, batch에서 분해된 raw 중복은 허용한다."""
+        items = grouped.setdefault(station_id, [])
+        refs = grouped.setdefault((station_id, '_refs'), set())
+        if token_ref is not None:
+            if token_ref in refs:
+                return
+            refs.add(token_ref)
+        items.append(object_id)
 
     def _clean_grouped_objects(self, grouped):
         return {k: v for k, v in grouped.items() if not isinstance(k, tuple)}
 
     def _append_slot_object(self, slot_objects, slot_token_refs, object_id, token_ref):
-        # batch에서 나온 raw도 로봇팔 명령에는 raw ID로 중복되어야 한다.
+        if token_ref is not None:
+            if token_ref in slot_token_refs:
+                return
+            slot_token_refs.add(token_ref)
         slot_objects.append(object_id)
 
     def _group_waste_items_by_station(self, waste_items):
         grouped = {}
+        seen_refs = set()
         for item in waste_items:
             station_id = item['station_id']
+            token_ref = item['token_ref']
             object_id = item['object_id']
+            key = (station_id, token_ref)
+            if key in seen_refs:
+                continue
+            seen_refs.add(key)
             grouped.setdefault(station_id, []).append(object_id)
         return grouped
 
@@ -1198,62 +1154,6 @@ class PlanningNode(Node):
         if task['order_type'] == Order.OT_RECYCLE:
             return f'RECYCLE {task["product_id"]}'
         return f'UNKNOWN {task["product_id"]}'
-
-    def _log_station_expected(self, station_items, produce_orders, recycle_orders):
-        """arena_layout의 station material_ids를 planner가 어떻게 해석했는지 출력한다.
-
-        일반 batch 10~80은 공식 정의에 따라 raw 5개로 펼쳐 보여준다.
-        mixed batch 90은 고정 분해하지 않고 부족 원재료 보충용으로 표시한다.
-        ARM 명령에는 batch ID가 아니라 필요한 raw ID가 들어간다.
-        """
-        batch_usage = Counter()
-
-        for order in produce_orders:
-            for (material, source, dep_recycle, object_id, token_ref) in order.get('material_sources', []):
-                if token_ref is None:
-                    continue
-                token = self._token_info.get(token_ref)
-                if token and token.get('is_batch', False):
-                    batch_usage[token_ref] += 1
-
-        for order in recycle_orders:
-            for item in order.get('waste_items', []):
-                token_ref = item.get('token_ref')
-                token = self._token_info.get(token_ref)
-                if token and token.get('is_batch', False):
-                    batch_usage[token_ref] += 1
-
-        self.get_logger().info('===== 스테이션 예상 로그 =====')
-
-        for station_id in sorted(station_items.keys()):
-            original = list(station_items[station_id])
-            tokens = list(self._station_tokens_by_station.get(station_id, []))
-            used_token_indices = set()
-            expanded = []
-            changed = False
-
-            for object_id in original:
-                if object_id in BATCH_TO_RAW:
-                    raw = BATCH_TO_RAW[object_id]
-                    expanded.extend([raw] * BATCH_SIZE)
-                    changed = True
-                elif object_id == MIXED_BATCH:
-                    expanded.append('MIXED_BATCH(부족 원재료 보충용)')
-                    changed = True
-                else:
-                    raw, _, _ = self._decode_station_object(object_id)
-                    expanded.append(raw if raw is not None else object_id)
-
-            if changed:
-                self.get_logger().info(
-                    f'station={station_id} : {original} -> {expanded}'
-                )
-            else:
-                self.get_logger().info(
-                    f'station={station_id} : {original}'
-                )
-
-        self.get_logger().info('==============================')
 
     def _log_cost_summary(self, wb_sequence, wb_id, customer_id):
         self.get_logger().info('===== 시간 비용 기반 WB 작업 순서 =====')
@@ -1320,7 +1220,7 @@ class PlanningNode(Node):
                     )
                 else:
                     self.get_logger().info(
-                        f'  -> {material} : station={source} 에서 command_object={object_id} Load'
+                        f'  -> {material} : station={source} 에서 object_id={object_id} Load'
                     )
 
         self.get_logger().info('==========================')
