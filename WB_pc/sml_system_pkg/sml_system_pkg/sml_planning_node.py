@@ -86,7 +86,7 @@ FIXED_WORKBENCH_STATION_ID = 7
 
 STATION_COORD_JSON_PARAM = 'station_coord_json_path'
 DEFAULT_STATION_COORD_JSON_PATH = (
-    '/home/vision/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
+    '/home/user/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
 )
 
 # 메시지에 OT_LIFECYCLE이 없을 수도 있으므로 3을 fallback으로 사용
@@ -704,7 +704,7 @@ class PlanningNode(Node):
         loaded_sources   = set()  # (produce_order_id, material_index)
         current_station  = STATION_START_GOAL
 
-        for wb_task in wb_sequence:
+        for wb_index, wb_task in enumerate(wb_sequence):
 
             # ------------------------------------------------
             # RECYCLE: 분해 대상은 무조건 CUSTOMER에서 Load
@@ -735,23 +735,17 @@ class PlanningNode(Node):
                     slot_1 = None
 
                 # 다음 PRODUCE 재료 미리 적재 (초기 재고에서 가져올 수 있는 것만)
-                preload_by_station = {}
-                for future_task in wb_sequence:
-                    if future_task['order_type'] != Order.OT_PRODUCE:
-                        continue
-                    for index, (material, source, dep, object_id, token_ref) in enumerate(
-                            future_task['material_sources']):
-                        source_key = (id(future_task), index)
-                        if dep is None \
-                                and len(slot_material) < 5 \
-                                and source_key not in loaded_sources:
-                            self._add_grouped_object(
-                                preload_by_station, source, object_id, token_ref
-                            )
-                            self._append_slot_object(
-                                slot_material, slot_token_refs, object_id, token_ref
-                            )
-                            loaded_sources.add(source_key)
+                preload_by_station = self._collect_future_produce_preloads(
+                    wb_sequence, wb_index,
+                    slot_material, slot_token_refs, loaded_sources
+                )
+
+                if self._clean_grouped_objects(preload_by_station):
+                    self.get_logger().info(
+                        f'[PRELOAD] {self._task_label(wb_task)} 처리 중 '
+                        f'다음 PRODUCE 재료 추가 적재: '
+                        f'{self._clean_grouped_objects(preload_by_station)}'
+                    )
 
                 ordered_sources = self._order_sources_by_travel(
                     self._clean_grouped_objects(preload_by_station), current_station
@@ -786,6 +780,8 @@ class PlanningNode(Node):
                     pending_loads   = []
 
                 load_by_station = {}
+
+                # 1) 현재 PRODUCE에 필요한 초기 재고 재료를 먼저 적재한다.
                 for index, (material, source, dep, object_id, token_ref) in enumerate(
                         wb_task['material_sources']):
                     source_key = (id(wb_task), index)
@@ -797,6 +793,27 @@ class PlanningNode(Node):
                             slot_material, slot_token_refs, object_id, token_ref
                         )
                         loaded_sources.add(source_key)
+
+                # 2) AMR raw 적재공간에 여유가 있으면 다음 PRODUCE 재료도 미리 적재한다.
+                #    이미 WB에 내려둔 재료는 loaded_sources로 표시되므로, 해당 주문 차례에서는
+                #    다시 LOAD하지 않고 WB 작업만 수행한다.
+                preload_by_station = self._collect_future_produce_preloads(
+                    wb_sequence, wb_index,
+                    slot_material, slot_token_refs, loaded_sources
+                )
+                if self._clean_grouped_objects(preload_by_station):
+                    self.get_logger().info(
+                        f'[PRELOAD] {self._task_label(wb_task)} 처리 중 '
+                        f'다음 PRODUCE 재료 추가 적재: '
+                        f'{self._clean_grouped_objects(preload_by_station)}'
+                    )
+
+                for station_id, object_ids in self._clean_grouped_objects(
+                        preload_by_station).items():
+                    for object_id in object_ids:
+                        self._add_grouped_object(
+                            load_by_station, station_id, object_id, None
+                        )
 
                 ordered_sources = self._order_sources_by_travel(
                     self._clean_grouped_objects(load_by_station), current_station
@@ -931,6 +948,50 @@ class PlanningNode(Node):
     # --------------------------------------------------------
     # 헬퍼 함수
     # --------------------------------------------------------
+
+    def _collect_future_produce_preloads(
+        self, wb_sequence, current_index,
+        slot_material, slot_token_refs, loaded_sources
+    ):
+        """
+        AMR raw 적재공간에 남는 칸이 있으면 뒤쪽 PRODUCE 재료를 미리 적재한다.
+
+        조건
+        - 현재 WB task 이후의 PRODUCE만 대상
+        - 초기 재고에서 가져올 수 있는 재료(dep is None)만 대상
+        - RECYCLE 후 WB에서 재사용해야 하는 재료는 미리 LOAD하지 않음
+        - MAX_RAW_CAPACITY를 넘지 않음
+        - 같은 token_ref는 중복 적재하지 않음
+        """
+        preload_by_station = {}
+
+        for future_task in wb_sequence[current_index + 1:]:
+            if future_task['order_type'] != Order.OT_PRODUCE:
+                continue
+
+            for index, (material, source, dep, object_id, token_ref) in enumerate(
+                    future_task['material_sources']):
+                if len(slot_material) >= MAX_RAW_CAPACITY:
+                    return preload_by_station
+
+                source_key = (id(future_task), index)
+
+                if dep is not None:
+                    continue
+                if not isinstance(source, int):
+                    continue
+                if source_key in loaded_sources:
+                    continue
+
+                self._add_grouped_object(
+                    preload_by_station, source, object_id, token_ref
+                )
+                self._append_slot_object(
+                    slot_material, slot_token_refs, object_id, token_ref
+                )
+                loaded_sources.add(source_key)
+
+        return preload_by_station
 
     def _station_coord(self, station_id):
         if station_id in self.station_coords:
