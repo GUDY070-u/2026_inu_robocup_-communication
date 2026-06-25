@@ -80,13 +80,13 @@ MAX_PRODUCT_CAPACITY = 1
 # 대회 arena_layout에는 포함되지 않는 AMR의 시작/복귀 지점.
 STATION_START_GOAL = 0
 
-# 기존 A-zone 좌표 기준에서는 station 5가 A_MAIN_WORKBENCH다.
-# arena_layout에 5번 workbench가 없으면 들어온 workbench 중 비용이 작은 station을 선택한다.
-MAIN_WORKBENCH_STATION_ID = 5
+# 실제 시스템에서 작업로봇이 연결된 WORKBENCH station.
+# arena_layout에 여러 WORKBENCH가 들어와도 플래너는 이 station만 사용한다.
+FIXED_WORKBENCH_STATION_ID = 7
 
 STATION_COORD_JSON_PARAM = 'station_coord_json_path'
 DEFAULT_STATION_COORD_JSON_PATH = (
-    '/home/user/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
+    '/home/vision/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
 )
 
 # 메시지에 OT_LIFECYCLE이 없을 수도 있으므로 3을 fallback으로 사용
@@ -411,12 +411,19 @@ class PlanningNode(Node):
                     # 생산 재료로 사용할 수 있도록 stock으로 둔다.
                     stock_tokens.append(token)
 
-        if workbench_ids:
-            wb_id = self._select_workbench_by_cost(
-                workbench_ids, station_items, customer_id
-            )
-        else:
+        if not workbench_ids:
             raise RuntimeError('arena_layout에 WORKBENCH station이 없습니다')
+
+        # 작업로봇은 실제 시스템에서 station 7번에 고정되어 있으므로,
+        # 비용 기반으로 WORKBENCH를 선택하지 않는다.
+        if FIXED_WORKBENCH_STATION_ID not in workbench_ids:
+            raise RuntimeError(
+                f'고정 작업로봇 station {FIXED_WORKBENCH_STATION_ID}이 '
+                f'arena_layout의 WORKBENCH 목록에 없습니다. '
+                f'현재 WORKBENCH 후보={workbench_ids}'
+            )
+        wb_id = FIXED_WORKBENCH_STATION_ID
+        self.get_logger().info(f'[WB] fixed workbench={wb_id} 사용')
 
         if customer_id is None:
             raise RuntimeError('arena_layout에 CUSTOMER station이 없습니다')
@@ -967,38 +974,6 @@ class PlanningNode(Node):
             current = station_id
             remaining.pop(idx)
         return ordered
-
-    def _select_workbench_by_cost(self, workbench_ids, station_items, customer_id):
-        if not self.use_time_cost:
-            if MAIN_WORKBENCH_STATION_ID in workbench_ids:
-                return MAIN_WORKBENCH_STATION_ID
-            return workbench_ids[0]
-
-        scores = []
-        for wb_id in workbench_ids:
-            score = self._travel_time(STATION_START_GOAL, wb_id)
-            if customer_id is not None:
-                score += self._travel_time(customer_id, wb_id)
-                score += self._travel_time(wb_id, customer_id)
-            for station_id, object_ids in station_items.items():
-                # workbench/customer 자체 material은 source station 후보에서 제외한다.
-                if station_id == wb_id or station_id == customer_id:
-                    continue
-                raw_count = 0
-                for object_id in object_ids:
-                    raw, count = self._decode_station_object(object_id)
-                    if raw is not None:
-                        raw_count += max(1, count)
-                if raw_count:
-                    score += raw_count * self._travel_time(station_id, wb_id)
-            scores.append((score, wb_id))
-
-        scores.sort()
-        chosen_score, chosen_wb = scores[0]
-        self.get_logger().info(
-            f'[COST] selected workbench={chosen_wb} estimated_score={chosen_score:.2f}'
-        )
-        return chosen_wb
 
     def _estimate_task_cost(self, task, wb_id, customer_id):
         """원래 planner의 시간 비용 항목을 유지한 간단 추정값."""
