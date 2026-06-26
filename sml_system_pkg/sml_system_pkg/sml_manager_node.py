@@ -621,8 +621,7 @@ class SmlManagerNode(Node):
         if plan_start_time is not None and plan_end_time is not None:
             wall_elapsed = plan_end_time - plan_start_time
             self.get_logger().info(
-                f'전체 실행 wall-clock 시간: {wall_elapsed:.2f}s '
-                f'(AMR/WB 병렬 실행 때문에 step 합계와 다를 수 있음)')
+                f'전체 실행 wall-clock 시간: {wall_elapsed:.2f}s ')
 
         self.get_logger().info('==============================')
 
