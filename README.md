@@ -1,3 +1,21 @@
+
+## 추천 테스트 순서
+
+처음에는 Case 1로 planner와 manager의 기본 동작을 확인합니다.
+
+```text
+Case 1:
+order_server → planner → manager → mock nodes
+```
+
+이후 Case 2로 공식 Task 수신과 adapter 변환까지 포함한 흐름을 확인합니다.
+
+```text
+Case 2:
+eai_task_server → adapter → planner → manager → mock nodes
+```
+---
+Case 2까지 정상 동작하면 실제 경기장에서는 `eai_task_server` 대신 대회 서버가 제공하는 Task topic을 adapter가 구독하도록 설정하면 됩니다.
 ## ▶️ 실행 방법
 
 * **Case 1. 자체 모의 테스트**
@@ -286,20 +304,3 @@ Type: sml_msgs/msg/Task
 
 ---
 
-## 추천 테스트 순서
-
-처음에는 Case 1로 planner와 manager의 기본 동작을 확인합니다.
-
-```text
-Case 1:
-order_server → planner → manager → mock nodes
-```
-
-이후 Case 2로 공식 Task 수신과 adapter 변환까지 포함한 흐름을 확인합니다.
-
-```text
-Case 2:
-eai_task_server → adapter → planner → manager → mock nodes
-```
-
-Case 2까지 정상 동작하면 실제 경기장에서는 `eai_task_server` 대신 대회 서버가 제공하는 Task topic을 adapter가 구독하도록 설정하면 됩니다.
