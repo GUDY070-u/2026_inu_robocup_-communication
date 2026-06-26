@@ -13,7 +13,7 @@ from rclpy.executors import MultiThreadedExecutor
 
 from sml_msgs.action import WbTask
 
-WB_DELAY = 1.5  # 작업 시뮬레이션 시간 (초)
+WB_DELAY = 60.0  # 작업 시뮬레이션 시간 (초)
 
 
 class MockWbNode(Node):
