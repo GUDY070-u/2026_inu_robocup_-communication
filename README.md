@@ -166,7 +166,7 @@ stage:
   advanced
 ```
 
-### 터미널 5 — eai_task_adapter
+### 터미널 5 — eai_task_adapter : 대회 명령어 변환 노드
 
 ```bash
 ros2 run sml_system_pkg eai_task_adapter --ros-args \
