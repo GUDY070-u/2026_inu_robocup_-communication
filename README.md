@@ -24,14 +24,6 @@ Case 2까지 정상 동작하면 실제 경기장에서는 `eai_task_server` 대
 * **Case 2. eai_task_server 기반 모의 테스트**
   공식 `eai_task_server`가 `/eai/task/side_a`를 발행하고, `eai_task_adapter`가 이를 `/sml/task`로 변환하여 우리 시스템에 전달합니다.
 
-모든 터미널에서 공통으로 아래 명령어를 먼저 실행합니다.
-
-```bash
-cd ~/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-```
-
 ---
 
 ## Case 1. 우리가 만든 모의 테스트
@@ -98,18 +90,11 @@ ros2 run sml_system_pkg order_server
 4. 실행 계획 요약
 5. 스텝 시퀀스
 ```
-
-manager에서 아래 로그가 출력되면 전체 스텝 실행이 완료된 것입니다.
-
-```text
-[MANAGER] ✅ 모든 스텝 완료!
-```
-
 ---
 
 ## Case 2. eai_task_server 기반 모의 테스트
 
-이 방식은 공식 `eai_task_server`를 사용하여 실제 경기 환경과 유사하게 Task를 수신하는 테스트입니다.
+이 방식은 공식 `eai_task_server`를 사용하여Task를 수신하는 테스트입니다.
 
 공식 서버는 `/eai/task/side_a`에 `sml_messages/msg/Task` 타입의 Task를 발행합니다.
 우리 planner는 `/sml/task`의 `sml_msgs/msg/Task`를 사용하므로, 중간에 `eai_task_adapter`를 실행하여 메시지를 변환합니다.
