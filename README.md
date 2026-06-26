@@ -43,37 +43,37 @@ sml_manager_node
 mock_nav_node / mock_arm_node / mock_wb_node
 ```
 
-### 터미널 1 — mock nav
+### 터미널 1 — mock nav : 자율주행 목업
 
 ```bash
 ros2 run sml_system_pkg mock_nav_node
 ```
 
-### 터미널 2 — mock arm
+### 터미널 2 — mock arm : AMR 메니퓰 목업
 
 ```bash
 ros2 run sml_system_pkg mock_arm_node
 ```
 
-### 터미널 3 — mock wb
+### 터미널 3 — mock wb : 조립로봇 목업
 
 ```bash
 ros2 run sml_system_pkg mock_wb_node
 ```
 
-### 터미널 4 — planning node
+### 터미널 4 — planning node : 경로 계획 노드
 
 ```bash
 ros2 run sml_system_pkg sml_planning_node
 ```
 
-### 터미널 5 — manager node
+### 터미널 5 — manager node :  : 모니터링 노드
 
 ```bash
 ros2 run sml_system_pkg sml_manager_node
 ```
 
-### 터미널 6 — order server
+### 터미널 6 — order server : 주문 랜덤 생성 노드
 
 ```bash
 ros2 run sml_system_pkg order_server
