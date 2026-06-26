@@ -11,6 +11,7 @@ A/B 경기장 대응:
 """
 
 import threading
+import time
 
 import rclpy
 from rclpy.action import ActionClient
@@ -43,6 +44,14 @@ class SmlManagerNode(Node):
         self.amr_busy        = False    # AMR 트랙 점유 여부
         self.wb_busy         = False    # WB 트랙 점유 여부
         self.plan_requested  = False    # GetPlan 요청 여부 (중복 방지)
+
+        # step 소요 시간 측정 관련
+        self.step_start_times       = {}     # step_id -> time.monotonic() 시작 시각
+        self.step_elapsed_times     = {}     # step_id -> 완료까지 걸린 시간 [s]
+        self.step_records           = {}     # step_id -> 로그 요약용 metadata
+        self.plan_start_time        = None   # 전체 실행 시작 시각
+        self.plan_end_time          = None   # 전체 실행 종료 시각
+        self._duration_summary_done = False  # 최종 요약 중복 출력 방지
 
         # GetPlan 재시도 관련
         self._plan_retry_count = 0
@@ -138,6 +147,20 @@ class SmlManagerNode(Node):
 
         with self._lock:
             self.pending_steps = list(response.steps)
+            self.completed_steps.clear()
+            self.amr_busy = False
+            self.wb_busy = False
+
+            # 새 계획 기준으로 시간 측정값 초기화
+            self.step_start_times.clear()
+            self.step_elapsed_times.clear()
+            self.step_records.clear()
+            self.plan_start_time = time.monotonic()
+            self.plan_end_time = None
+            self._duration_summary_done = False
+
+            for step in response.steps:
+                self.step_records[int(step.step_id)] = self._make_step_record(step)
 
         self._dispatch()
 
@@ -191,7 +214,13 @@ class SmlManagerNode(Node):
                          and not self.amr_busy and not self.wb_busy
                          and amr_step is None and wb_step is None)
 
+            should_log_all_done = all_done and not self._duration_summary_done
+            if should_log_all_done:
+                self._duration_summary_done = True
+                self.plan_end_time = time.monotonic()
+
         if amr_step:
+            self._mark_step_started(amr_step)
             self.get_logger().info(
                 f'[MANAGER] AMR step {amr_step.step_id} 시작 '
                 f'(action={amr_step.action}, '
@@ -202,6 +231,7 @@ class SmlManagerNode(Node):
             self._execute_amr(amr_step)
 
         if wb_step:
+            self._mark_step_started(wb_step)
             self.get_logger().info(
                 f'[MANAGER] WB step {wb_step.step_id} 시작 '
                 f'(action={wb_step.action}, '
@@ -210,17 +240,37 @@ class SmlManagerNode(Node):
                 f'WB step {wb_step.step_id} 실행 중')
             self._execute_wb(wb_step)
 
-        if all_done:
+        if should_log_all_done:
             self.get_logger().info('[MANAGER] ✅ 모든 스텝 완료!')
+            self._log_step_duration_summary()
             self._publish_status('완료')
 
     def _on_step_complete(self, step_id):
         with self._lock:
+            now = time.monotonic()
+            start_time = self.step_start_times.get(step_id)
+            elapsed = None
+            if start_time is not None:
+                elapsed = now - start_time
+                self.step_elapsed_times[step_id] = elapsed
+
             self.completed_steps.add(step_id)
+            completed = sorted(self.completed_steps)
+            remaining = len(self.pending_steps)
+
+        if elapsed is None:
+            self.get_logger().warn(
+                f'[TIME] step {step_id} 시작 시간이 없어 소요 시간을 계산할 수 없습니다')
+        else:
             self.get_logger().info(
-                f'[MANAGER] step {step_id} 완료 '
-                f'| 완료: {sorted(self.completed_steps)} '
-                f'| 남은 스텝: {len(self.pending_steps)}개')
+                f'[TIME] step {step_id} 소요 시간: {elapsed:.2f}s')
+
+        self.get_logger().info(
+            f'[MANAGER] step {step_id} 완료 '
+            f'| 완료: {completed} '
+            f'| 남은 스텝: {remaining}개')
+
+        # 소요 시간 로그를 먼저 남긴 뒤 다음 ready step을 실행한다.
         self._dispatch()
 
     # ──────────────────────────────────────────────────────
@@ -506,6 +556,75 @@ class SmlManagerNode(Node):
     # ──────────────────────────────────────────────────────
     # 유틸리티
     # ──────────────────────────────────────────────────────
+
+    def _step_type_name(self, step_type):
+        type_map = {Step.AMR: 'AMR', Step.WB: 'WB '}
+        return type_map.get(step_type, '??')
+
+    def _step_action_name(self, action):
+        action_map = {
+            Step.LOAD:    'LOAD   ',
+            Step.UNLOAD:  'UNLOAD ',
+            Step.PRODUCE: 'PRODUCE',
+            Step.RECYCLE: 'RECYCLE',
+            Step.GOAL:    'GOAL   ',
+        }
+        return action_map.get(action, '?')
+
+    def _make_step_record(self, step):
+        return {
+            'step_id': int(step.step_id),
+            'type': self._step_type_name(step.type),
+            'action': self._step_action_name(step.action),
+            'objects': list(step.object_ids),
+            'station': int(step.station_id),
+            'depends_on': list(step.depends_on),
+        }
+
+    def _mark_step_started(self, step):
+        step_id = int(step.step_id)
+        with self._lock:
+            self.step_start_times.setdefault(step_id, time.monotonic())
+            self.step_records[step_id] = self._make_step_record(step)
+
+    def _log_step_duration_summary(self):
+        with self._lock:
+            records = dict(self.step_records)
+            elapsed_times = dict(self.step_elapsed_times)
+            plan_start_time = self.plan_start_time
+            plan_end_time = self.plan_end_time
+
+        self.get_logger().info('===== Step 소요 시간 요약 =====')
+
+        total_step_elapsed = 0.0
+        for step_id in sorted(records):
+            record = records[step_id]
+            elapsed = elapsed_times.get(step_id)
+
+            if elapsed is None:
+                elapsed_text = '미완료'
+            else:
+                elapsed_text = f'{elapsed:.2f}s'
+                total_step_elapsed += elapsed
+
+            self.get_logger().info(
+                f'[{step_id:2d}] {record["type"]} | '
+                f'{record["action"]} | '
+                f'objects={record["objects"]} | '
+                f'station={record["station"]} | '
+                f'elapsed={elapsed_text}'
+            )
+
+        self.get_logger().info(
+            f'개별 step 소요 시간 합계: {total_step_elapsed:.2f}s')
+
+        if plan_start_time is not None and plan_end_time is not None:
+            wall_elapsed = plan_end_time - plan_start_time
+            self.get_logger().info(
+                f'전체 실행 wall-clock 시간: {wall_elapsed:.2f}s '
+                f'(AMR/WB 병렬 실행 때문에 step 합계와 다를 수 있음)')
+
+        self.get_logger().info('==============================')
 
     def _publish_status(self, msg: str):
         status = String()
