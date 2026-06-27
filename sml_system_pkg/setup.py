@@ -21,16 +21,15 @@ setup(
     license='TODO',
     tests_require=['pytest'],
     entry_points={
-        'console_scripts': [
-            'order_server      = sml_system_pkg.order_server:main',
-            'sml_planning_node_plan_a = sml_system_pkg.sml_planning_node_plan_a:main',
-            'sml_planning_node_plan_b = sml_system_pkg.sml_planning_node_plan_b:main',
-            'sml_planning_node_plan_c = sml_system_pkg.sml_planning_node_plan_c:main',
-            'sml_manager_node  = sml_system_pkg.sml_manager_node:main',
-            'mock_nav_node     = sml_system_pkg.mock_nav_node:main',
-            'mock_arm_node     = sml_system_pkg.mock_arm_node:main',
-            'mock_wb_node      = sml_system_pkg.mock_wb_node:main',
-            'eai_task_adapter_node = sml_system_pkg.eai_task_adapter_node:main',
+            'console_scripts': [
+                'order_server = sml_system_pkg.order_server:main',
+                'sml_planning_node = sml_system_pkg.sml_planning_node:main',
+                'sml_manager_node = sml_system_pkg.sml_manager_node:main',
+                'mock_nav_node = sml_system_pkg.mock_nav_node:main',
+                'mock_arm_node = sml_system_pkg.mock_arm_node:main',
+                'mock_wb_node = sml_system_pkg.mock_wb_node:main',
+                'eai_task_adapter_node = sml_system_pkg.eai_task_adapter_node:main',
         ],
     },
 )
+

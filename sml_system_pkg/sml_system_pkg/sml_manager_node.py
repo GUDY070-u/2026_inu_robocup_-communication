@@ -6,8 +6,7 @@ depends_on 기반으로 AMR / WB를 병렬 실행하는 노드.
 A/B 경기장 대응:
   - side:=a 또는 side:=b 파라미터 사용
   - 일반 station은 Step.station_id를 그대로 AMR에 전달
-  - GOAL/복귀 station_id=0은 navigator goal 타입이 string이면 "a"/"b"로 전달
-  - navigator goal 타입이 int32이면 현재 인터페이스 한계상 0을 유지하고 경고 로그를 출력
+  - GOAL/복귀 station_id=0은 "a"/"b"로 변환하지 않고 숫자 0으로 전달
 """
 
 import threading
@@ -292,40 +291,40 @@ class SmlManagerNode(Node):
         """
         navigator goal에 target을 넣는다.
 
-        - station_id == 0이면 side별로 "a"/"b"를 목표로 사용한다.
-        - NavTask.Goal.station_id가 string 타입이면 "a"/"b"를 그대로 넣는다.
-        - NavTask.Goal.station_id가 int 타입이면 인터페이스 한계상 0을 넣고 경고한다.
-        - goal에 location/target/station_name 같은 string 필드가 있으면 함께 채운다.
+        - 일반 station은 숫자 station_id를 그대로 사용한다.
+        - START/GOAL 복귀 station_id=0도 "a"/"b"로 바꾸지 않고 0으로 전송한다.
+        - goal에 location/target/station_name 같은 string 필드가 있으면 문자열 형태의 숫자를 함께 채운다.
         """
-        nav_target = nav_target_for_station(int(station_id), self.side)
+        station_id = int(station_id)
+
+        # 혼동 방지를 위해 복귀 지점도 a/b label이 아니라 숫자 0으로 통일한다.
+        if station_id == 0:
+            nav_target = '0'
+            numeric_target = 0
+        else:
+            nav_target = nav_target_for_station(station_id, self.side)
+            numeric_target = int(nav_target)
+
         field_types = goal.get_fields_and_field_types()
 
-        # 보조 문자열 필드가 존재하면 채움
+        # 보조 문자열 필드가 존재하면 숫자를 문자열로 채움. 예: "1", "8", "0"
         for string_field in ('location', 'target', 'station_name', 'station_label'):
             if string_field in field_types and field_types[string_field] == 'string':
-                setattr(goal, string_field, nav_target)
+                setattr(goal, string_field, str(numeric_target))
 
         if 'station_id' in field_types:
             station_id_type = field_types['station_id']
 
             if station_id_type == 'string':
-                goal.station_id = nav_target
-                return nav_target
+                goal.station_id = str(numeric_target)
+                return str(numeric_target)
 
             # int 계열 station_id
-            if nav_target in ('a', 'b'):
-                self.get_logger().warn(
-                    '[NAV] NavTask.Goal.station_id가 숫자 타입입니다. '
-                    f'복귀 label={nav_target}를 직접 넣을 수 없어 station_id=0으로 전송합니다. '
-                    'navigator에서 side 파라미터로 0을 a/b home으로 해석해야 합니다.'
-                )
-                goal.station_id = 0
-            else:
-                goal.station_id = int(nav_target)
-            return nav_target
+            goal.station_id = int(numeric_target)
+            return str(numeric_target)
 
         # station_id 필드가 없고 target/location만 있는 경우
-        return nav_target
+        return str(numeric_target)
 
     def _execute_amr(self, step, retry=0):
         MAX_RETRY = 1
@@ -474,7 +473,7 @@ class SmlManagerNode(Node):
         req = ArmCommand.Request()
         req.action = 'PRODUCE'
         req.object_ids = list(step.object_ids)
-        req.location = str(nav_target)
+        req.location = int(step.station_id)
 
         self.get_logger().info(
             f'[ARM/PRODUCE] step {step.step_id} → '
@@ -623,7 +622,7 @@ class SmlManagerNode(Node):
         if should_log:
             self.get_logger().error(
                 f'[AMR PRODUCE] step {step.step_id} 실패: {reason}')
-
+            
     def _execute_arm(self, step, retry=0):
         MAX_RETRY = 1
 
@@ -634,30 +633,27 @@ class SmlManagerNode(Node):
                 self.amr_busy = False
             return
 
+        req = ArmCommand.Request()
+
         if step.action == Step.LOAD:
-            action_name = 'LOAD'
+            req.action = 'LOAD'
         elif step.action == Step.UNLOAD:
-            action_name = 'UNLOAD'
+            req.action = 'UNLOAD'
         elif step.action == Step.PRODUCE:
-            # 방어 코드:
-            # Plan C AMR PRODUCE는 _execute_amr_produce()에서 처리되어야 한다.
-            # 그래도 직접 들어오면 PRODUCE service로 보낸다.
-            action_name = 'PRODUCE'
+            req.action = 'PRODUCE'
         else:
             self.get_logger().error(
-                f'[ARM] step {step.step_id}: 지원하지 않는 AMR action={step.action}')
+                f'[ARM] step {step.step_id}: 지원하지 않는 action={step.action}')
             with self._lock:
                 self.amr_busy = False
             return
 
-        req = ArmCommand.Request()
-        req.action     = action_name
         req.object_ids = list(step.object_ids)
-        req.location   = ''
+        req.location = int(step.station_id)
 
         self.get_logger().info(
             f'[ARM] step {step.step_id} → '
-            f'{req.action} {list(step.object_ids)}')
+            f'{req.action} {list(step.object_ids)} | location={req.location}')
 
         future = self.arm_client.call_async(req)
         future.add_done_callback(
