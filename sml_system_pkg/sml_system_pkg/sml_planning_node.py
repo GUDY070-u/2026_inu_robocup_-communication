@@ -4,15 +4,16 @@
 항상 sml_system_pkg.planning.PlannerCore, 즉 Plan C 플래너만 사용한다.
 
 A/B 경기장 대응:
-- Adapter가 넘긴 AMR 실제 station id를 PlannerCore 계산용 station id로 변환한다.
+- 경기 서버/OrderServer가 넘긴 AMR 실제 station id를 PlannerCore 계산용 station id로 변환한다.
 - side:=b일 때는 9~16을 계산용 1~8로 바꿔 PlannerCore/기존 JSON을 그대로 사용한다.
 - PlannerCore가 만든 Step은 다시 AMR 실제 station id로 복원한다.
+- 수신 직후 경기 서버가 준 원본 order_list / arena_layout을 로그로 출력한다.
 """
 
 import rclpy
 from rclpy.node import Node
 
-from sml_msgs.msg import Task, Station
+from sml_msgs.msg import Task, Station, Order
 from sml_msgs.srv import GetPlan
 
 from .arena_side_utils import (
@@ -25,6 +26,7 @@ from .planning.arena_parser import load_station_coord_json
 from .planning.planner_config import (
     AMR_SPEED,
     DEFAULT_STATION_COORD_JSON_PATH,
+    PRODUCT_NAMES,
     STATION_COORD_JSON_PARAM,
     PlannerConfig,
 )
@@ -87,6 +89,57 @@ class PlanningNode(Node):
             f'use_time_cost={use_time_cost} | coords={len(station_coords)}'
         )
 
+    # ──────────────────────────────────────────────────────
+    # 경기 서버 / OrderServer 원본 Task 로그
+    # ──────────────────────────────────────────────────────
+
+    def _order_type_label(self, order_type: int) -> str:
+        if order_type == Order.OT_PRODUCE:
+            return 'P'
+        if order_type == Order.OT_RECYCLE:
+            return 'R'
+        if order_type == getattr(Order, 'OT_LIFECYCLE', 3):
+            return 'L'
+        return '?'
+
+    def _product_name(self, product_id: int) -> str:
+        return PRODUCT_NAMES.get(int(product_id), 'Unknown')
+
+    def _log_task_from_server(self, task: Task):
+        """
+        경기 서버/OrderServer가 넘긴 원본 Task를 그대로 출력한다.
+
+        side=b인 경우 여기에는 9~16 station_id가 그대로 표시된다.
+        PlannerCore 계산용으로 1~8 변환하기 전의 원본 확인용 로그다.
+        """
+        self.get_logger().info('===== 경기 서버 Task 원본 =====')
+
+        self.get_logger().info('order_list = ')
+        self.get_logger().info('{')
+        for order in task.order_list:
+            order_type = int(order.order_type)
+            product_id = int(order.product_id)
+            label = self._order_type_label(order_type)
+            name = self._product_name(product_id)
+            self.get_logger().info(
+                f'   order_type = {order_type} ; '
+                f'product_id = {product_id:<18} '
+                f'# {name:<18} ({label})'
+            )
+        self.get_logger().info('}')
+
+        self.get_logger().info('arena_layout = ')
+        self.get_logger().info('{')
+        for station in task.arena_layout:
+            material_text = ', '.join(str(x) for x in list(station.material_ids))
+            self.get_logger().info(
+                f'   station_type = {int(station.station_type)}; '
+                f'station_id = {int(station.station_id)}; '
+                f'material_ids = {{{material_text}}}'
+            )
+        self.get_logger().info('}')
+        self.get_logger().info('===============================')
+
     def _task_for_planner_coordinates(self, task: Task) -> Task:
         """
         PlannerCore/JSON 계산용 Task 생성.
@@ -95,7 +148,7 @@ class PlanningNode(Node):
             station_id를 그대로 사용.
 
         side b:
-            Adapter가 만든 AMR station id 9~16을 PlannerCore 계산용 1~8로 변환.
+            Adapter/OrderServer가 만든 AMR station id 9~16을 PlannerCore 계산용 1~8로 변환.
             예: 15(B 조립로봇) -> 6(A 계산용 조립로봇 좌표)
         """
         if self.side == 'a':
@@ -156,6 +209,10 @@ class PlanningNode(Node):
         self.get_logger().info('Task 수신 → Plan C 계획 생성 시작')
 
         try:
+            # 경기 서버/OrderServer가 준 원본 task를 먼저 출력한다.
+            # side=b이면 9~16 station_id가 그대로 보인다.
+            self._log_task_from_server(task)
+
             planner_task = self._task_for_planner_coordinates(task)
             planned_steps = self.planner.build_plan(planner_task)
             self.steps = self._steps_to_amr_station_ids(planned_steps)

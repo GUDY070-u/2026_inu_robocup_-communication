@@ -65,6 +65,12 @@ TIER_STAGE_CONFIG = {
 TIER_NAMES  = {1: 'entry', 2: 'beginner', 3: 'advanced', 4: 'expert'}
 STAGE_NAMES = {1: 'production', 2: 'recycling', 3: 'lifecycle'}
 
+SIDE_NAMES = {1: 'a', 2: 'b'}
+SIDE_STATION_OFFSET = {
+    'a': 0,
+    'b': 8,
+}
+
 
 # ─────────────────────────────────────────────────────────────
 # 고정 아레나 배치 (German Open 2026 규정 기준)
@@ -95,6 +101,16 @@ class OrderServer(Node):
 
         self.task_pub  = self.create_publisher(Task, '/sml/task', 10)
         self.published = False
+
+        # ── 입력: 시작 위치 / 경기장 side ─────────────────────
+        self.side = self.get_input_side(
+            'Start 위치 선택 (1: A, 2: B): '
+        )
+        self.station_offset = SIDE_STATION_OFFSET[self.side]
+        print(
+            f'✓ side={self.side.upper()} 선택: '
+            f'station_id offset={self.station_offset}'
+        )
 
         # ── 입력: Tier ─────────────────────────────────────────
         tier_num = self.get_input_int(
@@ -203,6 +219,26 @@ class OrderServer(Node):
                 return value
             except ValueError:
                 print('정수를 입력하세요.')
+
+    def get_input_side(self, msg):
+        """A/B 경기장 side 입력.
+
+        A side: station_id 1~8 그대로 사용.
+        B side: station_id 1~8에 +8을 적용하여 9~16으로 발행.
+        """
+        while True:
+            raw = input(msg).strip().lower()
+
+            if raw in ('1', 'a'):
+                return 'a'
+            if raw in ('2', 'b'):
+                return 'b'
+
+            print('입력 가능 값: 1/A 또는 2/B')
+
+    def _to_side_station_id(self, base_station_id):
+        """Base station id(1~8)를 선택된 side의 실제 station id로 변환."""
+        return int(base_station_id) + int(self.station_offset)
 
     # ──────────────────────────────────────────────────────────
     # 제품 선택 (produce / recycle 분리)
@@ -352,8 +388,9 @@ class OrderServer(Node):
         arena_layout   = []
         storage_index  = 0
 
-        for station_id in sorted(STATION_LAYOUT.keys()):
-            station_type = STATION_LAYOUT[station_id]
+        for base_station_id in sorted(STATION_LAYOUT.keys()):
+            station_type = STATION_LAYOUT[base_station_id]
+            station_id = self._to_side_station_id(base_station_id)
 
             if station_type == ST_STORAGE:
                 material_ids = self._apply_station_batch_ids(
@@ -392,6 +429,8 @@ class OrderServer(Node):
         raw_target, raw_variance = self.config['raw_mat']
 
         print(f'\n# {self.tier.capitalize()} – {self.stage.capitalize()}\n')
+        print(f'# start_side      = {self.side.upper()}')
+        print(f'# station_offset  = {self.station_offset}')
         print(f'# time_limit      = {self.config["time"]} min')
         print(f'# produce_count   = {self.produce_count}')
         print(f'# recycle_count   = {self.recycle_count}')
@@ -434,7 +473,10 @@ class OrderServer(Node):
         if self.published:
             return
         self.task_pub.publish(self.task)
-        self.get_logger().info('Task published to /sml/task')
+        self.get_logger().info(
+            f'Task published to /sml/task | side={self.side} | '
+            f'station_offset={self.station_offset}'
+        )
         self.published = True
 
 
