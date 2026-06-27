@@ -1,9 +1,12 @@
-"""ROS2 planning node wrapper for Plan B.
+"""ROS2 planning node wrapper for Plan C only.
 
-Plan B:
-- 우리가 지금 만든 플래너
-- planning_plan_b 패키지 폴더 사용
-- 서비스: /sml/get_plan_plan_b
+이 버전은 Plan A/B를 전혀 참조하지 않는다.
+항상 sml_system_pkg.planning.PlannerCore, 즉 Plan C 플래너만 사용한다.
+
+A/B 경기장 대응:
+- Adapter가 넘긴 AMR 실제 station id를 PlannerCore 계산용 station id로 변환한다.
+- side:=b일 때는 9~16을 계산용 1~8로 바꿔 PlannerCore/기존 JSON을 그대로 사용한다.
+- PlannerCore가 만든 Step은 다시 AMR 실제 station id로 복원한다.
 """
 
 import rclpy
@@ -18,20 +21,20 @@ from .arena_side_utils import (
     amr_station_to_planner_station,
     planner_station_to_amr_station,
 )
-from .planning_plan_b.arena_parser import load_station_coord_json
-from .planning_plan_b.planner_config import (
+from .planning.arena_parser import load_station_coord_json
+from .planning.planner_config import (
     AMR_SPEED,
     DEFAULT_STATION_COORD_JSON_PATH,
     STATION_COORD_JSON_PARAM,
     PlannerConfig,
 )
-from .planning_plan_b.planner_core import PlannerCore
+from .planning.planner_core import PlannerCore
 
 
-class PlanningNodePlanB(Node):
+class PlanningNode(Node):
 
     def __init__(self):
-        super().__init__('planning_node_plan_b')
+        super().__init__('planning_node')
 
         self.plan_generated = False
         self.steps = []
@@ -42,7 +45,7 @@ class PlanningNodePlanB(Node):
         self.declare_parameter('amr_speed_mps', AMR_SPEED)
         self.declare_parameter(
             STATION_COORD_JSON_PARAM,
-            DEFAULT_STATION_COORD_JSON_PATH
+            DEFAULT_STATION_COORD_JSON_PATH,
         )
 
         task_topic = self.get_parameter('task_topic').value
@@ -60,12 +63,10 @@ class PlanningNodePlanB(Node):
             amr_speed_mps=amr_speed_mps,
             station_coord_json_path=station_coord_json_path,
         )
-
         station_coords = load_station_coord_json(
             config.station_coord_json_path,
             self.get_logger(),
         )
-
         self.planner = PlannerCore(
             config=config,
             station_coords=station_coords,
@@ -73,21 +74,15 @@ class PlanningNodePlanB(Node):
         )
 
         self.task_sub = self.create_subscription(
-            Task,
-            task_topic,
-            self.task_callback,
-            10,
+            Task, task_topic, self.task_callback, 10
         )
-
         self.plan_srv = self.create_service(
-            GetPlan,
-            '/sml/get_plan',
-            self.get_plan_callback,
+            GetPlan, '/sml/get_plan', self.get_plan_callback
         )
 
         self.get_logger().info(
-            f'[PLAN_B] PlanningNode 시작 | task_topic={task_topic} | '
-            f'side={self.side} | '
+            f'PlanningNode 시작 | task_topic={task_topic} | side={self.side} | '
+            f'planner=plan_c_only | '
             f'fixed_workbench_station={self.fixed_workbench_station} | '
             f'use_time_cost={use_time_cost} | coords={len(station_coords)}'
         )
@@ -121,7 +116,7 @@ class PlanningNodePlanB(Node):
             planner_task.arena_layout.append(dst_station)
 
             self.get_logger().info(
-                '[PLAN_B][PLANNER] station 계산용 변환: '
+                '[PLANNER] station 계산용 변환: '
                 f'amr_id={int(src_station.station_id)} -> '
                 f'planner_id={dst_station.station_id}, '
                 f'type={dst_station.station_type}, '
@@ -133,7 +128,6 @@ class PlanningNodePlanB(Node):
     def _steps_to_amr_station_ids(self, steps):
         """
         PlannerCore 결과 Step의 station_id를 AMR 실제 station id로 복원.
-
         side b:
             6 -> 15, 8 -> 16 등으로 변환.
         """
@@ -147,10 +141,9 @@ class PlanningNodePlanB(Node):
 
             if old_station != new_station:
                 self.get_logger().info(
-                    '[PLAN_B][PLANNER] step station AMR용 복원: '
+                    '[PLANNER] step station AMR용 복원: '
                     f'step={step.step_id}, '
-                    f'planner_station={old_station} -> '
-                    f'amr_station={new_station}'
+                    f'planner_station={old_station} -> amr_station={new_station}'
                 )
 
         return steps
@@ -160,43 +153,33 @@ class PlanningNodePlanB(Node):
             return
 
         self.plan_generated = True
-        self.get_logger().info('[PLAN_B] Task 수신 → 계획 생성 시작')
+        self.get_logger().info('Task 수신 → Plan C 계획 생성 시작')
 
         try:
             planner_task = self._task_for_planner_coordinates(task)
             planned_steps = self.planner.build_plan(planner_task)
             self.steps = self._steps_to_amr_station_ids(planned_steps)
-
-            self.get_logger().info(
-                f'[PLAN_B] 계획 생성 완료: {len(self.steps)}개 step'
-            )
-
         except Exception as e:
             self.steps = []
             self.plan_generated = False
-            self.get_logger().error(f'[PLAN_B] 계획 생성 실패: {e}')
+            self.get_logger().error(f'Plan C 계획 생성 실패: {e}')
 
     def get_plan_callback(self, request, response):
         if not self.plan_generated or not self.steps:
             response.success = False
-            response.message = '[PLAN_B] 계획이 아직 생성되지 않았습니다'
+            response.message = '계획이 아직 생성되지 않았습니다'
             return response
 
         response.steps = self.steps
         response.success = True
         response.message = ''
-
-        self.get_logger().info(
-            f'[PLAN_B] GetPlan 응답: {len(self.steps)}개 스텝 전달'
-        )
-
+        self.get_logger().info(f'GetPlan 응답: {len(self.steps)}개 스텝 전달')
         return response
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PlanningNodePlanB()
-
+    node = PlanningNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

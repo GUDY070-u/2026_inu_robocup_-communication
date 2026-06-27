@@ -45,6 +45,10 @@ class SmlManagerNode(Node):
         self.wb_busy         = False    # WB 트랙 점유 여부
         self.plan_requested  = False    # GetPlan 요청 여부 (중복 방지)
 
+        # Plan C: AMR PRODUCE는 이동과 AMR 내부 조립이 동시에 진행된다.
+        # step 완료 조건은 "NAV 도착 완료 AND AMR 조립 완료"이다.
+        self._amr_produce_states = {}
+
         # step 소요 시간 측정 관련
         self.step_start_times       = {}     # step_id -> time.monotonic() 시작 시각
         self.step_elapsed_times     = {}     # step_id -> 완료까지 걸린 시간 [s]
@@ -274,7 +278,14 @@ class SmlManagerNode(Node):
         self._dispatch()
 
     # ──────────────────────────────────────────────────────
-    # AMR 스텝 실행: NAV Action → ARM Service
+    # AMR 스텝 실행
+    #
+    # 일반 LOAD/UNLOAD:
+    #   NAV Action 완료 → ARM Service 실행 → post_process → step 완료
+    #
+    # Plan C AMR PRODUCE:
+    #   NAV Action과 AMR 내부 조립 Service를 동시에 시작한다.
+    #   NAV 도착과 조립 완료가 모두 끝난 뒤 post_process를 수행하고 step 완료 처리한다.
     # ──────────────────────────────────────────────────────
 
     def _assign_nav_goal_target(self, goal, station_id: int) -> str:
@@ -318,6 +329,14 @@ class SmlManagerNode(Node):
 
     def _execute_amr(self, step, retry=0):
         MAX_RETRY = 1
+
+        # Plan C:
+        # Step.AMR + Step.PRODUCE는 "목표 station으로 이동하면서 AMR 내부 조립"이다.
+        # 기존 LOAD/UNLOAD처럼 NAV 완료 후 ARM을 실행하면 이동 중 조립이 되지 않으므로
+        # 별도 경로에서 NAV와 PRODUCE service를 동시에 시작한다.
+        if step.action == Step.PRODUCE:
+            self._execute_amr_produce(step, retry=retry)
+            return
 
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error(
@@ -382,6 +401,229 @@ class SmlManagerNode(Node):
         self.get_logger().info(f'[NAV] step {step.step_id} → ARM 실행')
         self._execute_arm(step)
 
+    # ──────────────────────────────────────────────────────
+    # Plan C: AMR 내부 조립
+    # ──────────────────────────────────────────────────────
+
+    def _execute_amr_produce(self, step, retry=0):
+        """
+        Step.AMR + Step.PRODUCE 처리.
+
+        의미:
+            - step.station_id로 이동하면서 AMR 내부 조립공간에서 product_id를 조립한다.
+            - NAV 도착과 조립 완료가 모두 끝나야 step 완료로 본다.
+            - 이동이 먼저 끝나면 목적지에서 조립 완료까지 대기한다.
+            - 조립이 먼저 끝나면 목적지 도착까지 대기한다.
+        """
+        if not self.nav_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().error(
+                f'[AMR PRODUCE] step {step.step_id}: nav 서버 없음')
+            with self._lock:
+                self.amr_busy = False
+            return
+
+        if not self.arm_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error(
+                f'[AMR PRODUCE] step {step.step_id}: arm 서비스 없음')
+            with self._lock:
+                self.amr_busy = False
+            return
+
+        goal = NavTask.Goal()
+        nav_target = self._assign_nav_goal_target(goal, int(step.station_id))
+
+        with self._lock:
+            self._amr_produce_states[int(step.step_id)] = {
+                'nav_done': False,
+                'arm_done': False,
+                'failed': False,
+                'post_started': False,
+                'nav_target': nav_target,
+            }
+
+        self.get_logger().info(
+            f'[AMR PRODUCE] step {step.step_id} 시작 | '
+            f'product={list(step.object_ids)} | '
+            f'station_id={step.station_id}, nav_target={nav_target} | '
+            'NAV와 AMR 조립을 동시에 실행'
+        )
+
+        # 1) NAV 시작
+        self._send_amr_produce_nav(step, goal, retry=retry)
+
+        # 2) AMR 내부 조립 시작
+        self._send_amr_produce_arm(step, nav_target, retry=0)
+
+    def _send_amr_produce_nav(self, step, goal=None, retry=0):
+        if goal is None:
+            goal = NavTask.Goal()
+            nav_target = self._assign_nav_goal_target(goal, int(step.station_id))
+        else:
+            nav_target = self._get_amr_produce_nav_target(step)
+
+        self.get_logger().info(
+            f'[NAV/PRODUCE] step {step.step_id} → '
+            f'station_id={step.station_id}, nav_target={nav_target} 이동 시작'
+        )
+
+        send_future = self.nav_client.send_goal_async(goal)
+        send_future.add_done_callback(
+            lambda f, s=step, r=retry: self._on_amr_produce_nav_accepted(f, s, r))
+
+    def _send_amr_produce_arm(self, step, nav_target, retry=0):
+        req = ArmCommand.Request()
+        req.action = 'PRODUCE'
+        req.object_ids = list(step.object_ids)
+        req.location = str(nav_target)
+
+        self.get_logger().info(
+            f'[ARM/PRODUCE] step {step.step_id} → '
+            f'PRODUCE product={list(step.object_ids)} | '
+            f'location={req.location}'
+        )
+
+        future = self.arm_client.call_async(req)
+        future.add_done_callback(
+            lambda f, s=step, r=retry: self._on_amr_produce_arm_result(f, s, r))
+
+    def _get_amr_produce_nav_target(self, step):
+        with self._lock:
+            state = self._amr_produce_states.get(int(step.step_id), {})
+            return state.get('nav_target', str(step.station_id))
+
+    def _on_amr_produce_nav_accepted(self, future, step, retry):
+        try:
+            goal_handle = future.result()
+        except Exception as e:
+            self._fail_amr_produce_step(
+                step, f'NAV goal 전송 예외: {e}')
+            return
+
+        if not goal_handle.accepted:
+            self._fail_amr_produce_step(
+                step, 'NAV goal 거절됨')
+            return
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(
+            lambda f, s=step, r=retry: self._on_amr_produce_nav_result(f, s, r))
+
+    def _on_amr_produce_nav_result(self, future, step, retry):
+        MAX_RETRY = 1
+
+        try:
+            result = future.result().result
+        except Exception as e:
+            self._fail_amr_produce_step(
+                step, f'NAV 결과 수신 예외: {e}')
+            return
+
+        if not result.success:
+            self.get_logger().error(
+                f'[NAV/PRODUCE] step {step.step_id} 실패: {result.fail_reason}')
+
+            if retry < MAX_RETRY and result.fail_reason == 'NAV_FAILED':
+                self.get_logger().warn(
+                    f'[NAV/PRODUCE] step {step.step_id} 재시도 '
+                    f'({retry+1}/{MAX_RETRY})')
+                goal = NavTask.Goal()
+                self._assign_nav_goal_target(goal, int(step.station_id))
+                self._send_amr_produce_nav(step, goal, retry + 1)
+            else:
+                self._fail_amr_produce_step(
+                    step, f'NAV 최종 실패: {result.fail_reason}')
+            return
+
+        self.get_logger().info(
+            f'[NAV/PRODUCE] step {step.step_id} 도착 완료')
+        self._mark_amr_produce_part_done(step, 'nav')
+
+    def _on_amr_produce_arm_result(self, future, step, retry):
+        MAX_RETRY = 1
+
+        try:
+            response = future.result()
+        except Exception as e:
+            self.get_logger().error(
+                f'[ARM/PRODUCE] step {step.step_id} 예외: {e}')
+            if retry < MAX_RETRY:
+                nav_target = self._get_amr_produce_nav_target(step)
+                self.get_logger().warn(
+                    f'[ARM/PRODUCE] step {step.step_id} 재시도 '
+                    f'({retry+1}/{MAX_RETRY})')
+                self._send_amr_produce_arm(step, nav_target, retry + 1)
+            else:
+                self._fail_amr_produce_step(
+                    step, f'ARM PRODUCE 예외: {e}')
+            return
+
+        if not response.success:
+            message = getattr(response, 'message', '')
+            self.get_logger().error(
+                f'[ARM/PRODUCE] step {step.step_id} 실패: {message}')
+
+            retriable = 'object not found' not in message.lower()
+            if retry < MAX_RETRY and retriable:
+                nav_target = self._get_amr_produce_nav_target(step)
+                self.get_logger().warn(
+                    f'[ARM/PRODUCE] step {step.step_id} 재시도 '
+                    f'({retry+1}/{MAX_RETRY})')
+                self._send_amr_produce_arm(step, nav_target, retry + 1)
+            else:
+                self._fail_amr_produce_step(
+                    step, f'ARM PRODUCE 최종 실패: {message}')
+            return
+
+        self.get_logger().info(
+            f'[ARM/PRODUCE] step {step.step_id} 조립 완료 '
+            f'| slots={list(response.slots)}')
+        self._mark_amr_produce_part_done(step, 'arm')
+
+    def _mark_amr_produce_part_done(self, step, part):
+        ready_to_finish = False
+
+        with self._lock:
+            state = self._amr_produce_states.get(int(step.step_id))
+            if state is None or state.get('failed', False):
+                return
+
+            if part == 'nav':
+                state['nav_done'] = True
+            elif part == 'arm':
+                state['arm_done'] = True
+            else:
+                self.get_logger().warn(
+                    f'[AMR PRODUCE] 알 수 없는 완료 part={part}')
+                return
+
+            if state['nav_done'] and state['arm_done'] and not state['post_started']:
+                state['post_started'] = True
+                ready_to_finish = True
+
+        if ready_to_finish:
+            self.get_logger().info(
+                f'[AMR PRODUCE] step {step.step_id} '
+                'NAV 도착 + 조립 완료 → navigator 후처리 실행'
+            )
+            self._execute_nav_post_process(step)
+
+    def _fail_amr_produce_step(self, step, reason):
+        should_log = False
+
+        with self._lock:
+            state = self._amr_produce_states.get(int(step.step_id))
+            if state is None:
+                self.amr_busy = False
+                should_log = True
+            elif not state.get('failed', False):
+                state['failed'] = True
+                self.amr_busy = False
+                should_log = True
+
+        if should_log:
+            self.get_logger().error(
+                f'[AMR PRODUCE] step {step.step_id} 실패: {reason}')
+
     def _execute_arm(self, step, retry=0):
         MAX_RETRY = 1
 
@@ -392,8 +634,24 @@ class SmlManagerNode(Node):
                 self.amr_busy = False
             return
 
+        if step.action == Step.LOAD:
+            action_name = 'LOAD'
+        elif step.action == Step.UNLOAD:
+            action_name = 'UNLOAD'
+        elif step.action == Step.PRODUCE:
+            # 방어 코드:
+            # Plan C AMR PRODUCE는 _execute_amr_produce()에서 처리되어야 한다.
+            # 그래도 직접 들어오면 PRODUCE service로 보낸다.
+            action_name = 'PRODUCE'
+        else:
+            self.get_logger().error(
+                f'[ARM] step {step.step_id}: 지원하지 않는 AMR action={step.action}')
+            with self._lock:
+                self.amr_busy = False
+            return
+
         req = ArmCommand.Request()
-        req.action     = 'LOAD' if step.action == Step.LOAD else 'UNLOAD'
+        req.action     = action_name
         req.object_ids = list(step.object_ids)
         req.location   = ''
 
@@ -489,6 +747,7 @@ class SmlManagerNode(Node):
         self.get_logger().info(f'[POST] step {step.step_id} 완료')
         with self._lock:
             self.amr_busy = False
+            self._amr_produce_states.pop(int(step.step_id), None)
         self._on_step_complete(step.step_id)
 
     # ──────────────────────────────────────────────────────
