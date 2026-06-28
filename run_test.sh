@@ -54,17 +54,28 @@ mkdir -p "$LOG_DIR"
 echo "[INFO] 로그 저장 위치: $LOG_DIR"
 
 # ── 프로세스 정리 (Ctrl+C 또는 오류 시) ──────────────────────────────────────
+_kill_groups() {
+    local sig="$1"
+    local pids
+    pids=$(jobs -p 2>/dev/null) || true
+    [[ -z "$pids" ]] && return
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] && kill "-${sig}" -- "-${pid}" 2>/dev/null || true
+    done <<< "$pids"
+}
+
 cleanup() {
     echo ""
     echo "[INFO] 노드 종료 중..."
-    # jobs -p 는 이 셸이 시작한 모든 백그라운드 잡의 PID를 반환한다.
-    # 파이프라인(ros2 | tee)은 tee 만 $! 에 잡히므로, 프로세스 그룹째 kill.
-    local job_pids
-    job_pids=$(jobs -p 2>/dev/null) || true
-    if [[ -n "$job_pids" ]]; then
-        echo "$job_pids" | xargs -r kill -- 2>/dev/null || true
+    _kill_groups INT          # ROS2 노드는 SIGINT(Ctrl+C)로 정상 종료
+    sleep 2
+    _kill_groups KILL         # 2초 내 안 죽으면 강제 종료
+    # wait 는 자식 프로세스에만 작동하므로 살아있는 잡만 기다린다
+    local remaining
+    remaining=$(jobs -p 2>/dev/null) || true
+    if [[ -n "$remaining" ]]; then
+        wait 2>/dev/null || true
     fi
-    wait 2>/dev/null || true
     echo "[INFO] 완료. 로그: $LOG_DIR"
 }
 trap cleanup EXIT INT TERM
