@@ -88,12 +88,52 @@ start_node "planner_node"   ros2 run robocup_planner planner_node
 echo "[INFO] ${INIT_WAIT}초 대기 (노드 초기화)..."
 sleep "$INIT_WAIT"
 
-# ── order_server: stdin 자동 입력 ─────────────────────────────────────────────
+# ── 숫자 옵션 → 문자열 변환 (order_server ROS 파라미터용) ──────────────────────
+case "$START_SIDE" in
+    1) SIDE_STR="a" ;; 2) SIDE_STR="b" ;; *) SIDE_STR="$START_SIDE" ;;
+esac
+case "$TIER" in
+    1) TIER_STR="entry" ;; 2) TIER_STR="beginner" ;;
+    3) TIER_STR="advanced" ;; 4) TIER_STR="expert" ;; *) TIER_STR="$TIER" ;;
+esac
+case "$STAGE" in
+    1) STAGE_STR="production" ;; 2) STAGE_STR="recycling" ;;
+    3) STAGE_STR="lifecycle" ;; *) STAGE_STR="$STAGE" ;;
+esac
+case "$MODE" in
+    1) MODE_STR="preset" ;; 2) MODE_STR="random" ;; *) MODE_STR="$MODE" ;;
+esac
+
+# ── order_server: --ros-args 파라미터로 전달 + auto_publish ───────────────────
+# stdin 파이핑 대신 ROS 파라미터를 직접 넘긴다.
+# auto_publish:=true 이면 input() 호출 없이 즉시 publish하고 spin으로 넘어간다.
+# order_server 는 publish 후에도 rclpy.spin() 으로 계속 돌므로 백그라운드 실행.
 ORDER_LOG="$LOG_DIR/order_server.log"
 echo "[START] order_server → $ORDER_LOG"
-echo "[INFO]  side=$START_SIDE  tier=$TIER  stage=$STAGE  mode=$MODE"
-printf '%s\n' "$START_SIDE" "$TIER" "$STAGE" "$MODE" "" \
-    | ros2 run sml_system_pkg order_server 2>&1 | tee "$ORDER_LOG"
+echo "[INFO]  side=$SIDE_STR  tier=$TIER_STR  stage=$STAGE_STR  mode=$MODE_STR"
+ros2 run sml_system_pkg order_server \
+    --ros-args \
+    -p start_side:="$SIDE_STR" \
+    -p tier:="$TIER_STR" \
+    -p stage:="$STAGE_STR" \
+    -p mode:="$MODE_STR" \
+    -p auto_publish:=true \
+    2>&1 | tee "$ORDER_LOG" &
+
+# 태스크 발행 확인 (최대 15초 대기)
+echo "[INFO] order_server 발행 대기 중..."
+ELAPSED=0
+while [[ $ELAPSED -lt 15 ]]; do
+    if grep -q "Task published" "$ORDER_LOG" 2>/dev/null; then
+        echo "[INFO] 태스크 발행 완료 (${ELAPSED}초 경과)"
+        break
+    fi
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+done
+if [[ $ELAPSED -ge 15 ]]; then
+    echo "[WARN] order_server 발행 확인 실패 — 계속 진행합니다."
+fi
 
 # ── 플래너 종료 감지 (최대 5분 대기) ─────────────────────────────────────────
 PLANNER_LOG="$LOG_DIR/planner_node.log"
