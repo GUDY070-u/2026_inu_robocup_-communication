@@ -1,4 +1,4 @@
-"""Mock Workbench action server for Plan D tests.
+﻿"""Mock Workbench action server for Plan D tests.
 
 시간 모델:
   - delay_sec >= 0 이면 기존처럼 고정 지연 시간을 사용한다.
@@ -10,7 +10,7 @@ import time
 
 import rclpy
 from rclpy.action import ActionServer
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
@@ -35,7 +35,7 @@ PRODUCT_MATERIALS = {
 class MockWbNode(Node):
     def __init__(self):
         super().__init__('mock_wb_node')
-        self.cbg = ReentrantCallbackGroup()
+        self.cbg = MutuallyExclusiveCallbackGroup()
 
         # 기존 테스트 호환용. 0 이상이면 무조건 고정 지연 시간으로 사용.
         # 제품별 시간 모델을 쓰려면 -p delay_sec:=-1.0 으로 실행한다.
