@@ -18,6 +18,13 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+
+TASK_QOS = QoSProfile(
+    depth=1,
+    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+    reliability=QoSReliabilityPolicy.RELIABLE,
+)
 
 from sml_msgs.msg import Order, Station, Task
 
@@ -316,7 +323,7 @@ class OrderServer(Node):
         self.declare_parameter("seed", -1)
 
         self.task_topic = self.get_parameter("task_topic").value
-        self.task_pub = self.create_publisher(Task, self.task_topic, 10)
+        self.task_pub = self.create_publisher(Task, self.task_topic, TASK_QOS)
         self.published = False
 
         seed = int(self.get_parameter("seed").value)
@@ -349,7 +356,8 @@ class OrderServer(Node):
 
         auto_publish = bool(self.get_parameter("auto_publish").value)
         if auto_publish:
-            self.publish_task()
+            # Delay publish until after spin() so DDS discovery completes first
+            self._auto_pub_timer = self.create_timer(1.0, self._auto_publish_cb)
         else:
             input("엔터를 누르면 task를 publish합니다 (플래너로 전달): ")
             self.publish_task()
@@ -593,6 +601,10 @@ class OrderServer(Node):
     # ──────────────────────────────────────────────────────────
     # Publish
     # ──────────────────────────────────────────────────────────
+    def _auto_publish_cb(self) -> None:
+        self._auto_pub_timer.cancel()
+        self.publish_task()
+
     def publish_task(self) -> None:
         if self.published:
             return
