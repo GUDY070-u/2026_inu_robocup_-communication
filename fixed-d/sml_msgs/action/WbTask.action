@@ -1,0 +1,7 @@
+string work_type
+int32 product_id
+---
+bool success
+string fail_reason
+---
+string status

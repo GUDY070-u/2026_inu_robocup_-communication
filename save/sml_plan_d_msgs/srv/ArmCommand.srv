@@ -1,0 +1,14 @@
+# ArmCommand.srv
+# Plan D AMR arm command.
+# object_ids[i] corresponds to slide_ids[i] for LOAD/UNLOAD.
+# For PRODUCE, object_ids[0] is product_id and slide_ids lists used slots.
+
+string action
+int32[] object_ids
+int32 location
+int32[] slide_ids
+---
+bool success
+int32[] slots
+int32[] object_ids
+string message

@@ -1,0 +1,19 @@
+{
+  "map": {
+    "name": "A_zone_estimated",
+    "width_m": 10.0,
+    "height_m": 7.5,
+    "note": "fallback coordinates for Plan D source ordering"
+  },
+  "station_coordinates": {
+    "0": {"name": "START_GOAL", "x": 3.99, "y": 1.12},
+    "1": {"name": "STORAGE_1", "x": 2.25, "y": 0.67},
+    "2": {"name": "STORAGE_2", "x": 1.06, "y": 0.67},
+    "3": {"name": "WORKBENCH_3", "x": 0.34, "y": 1.93},
+    "4": {"name": "STORAGE_4", "x": 0.35, "y": 3.01},
+    "5": {"name": "STORAGE_5", "x": 1.70, "y": 3.58},
+    "6": {"name": "WORKBENCH_6", "x": 3.01, "y": 3.58},
+    "7": {"name": "WORKBENCH_7", "x": 4.20, "y": 3.00},
+    "8": {"name": "CUSTOMER", "x": 4.85, "y": 1.80}
+  }
+}

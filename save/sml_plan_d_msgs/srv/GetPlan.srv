@@ -1,0 +1,11 @@
+# GetPlan.srv
+
+# Request (ManagerNode -> PlanningNode)
+# Empty request means: return latest generated plan.
+
+---
+
+# Response (PlanningNode -> ManagerNode)
+sml_plan_d_msgs/Step[] steps
+bool success
+string message

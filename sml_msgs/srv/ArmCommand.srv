@@ -1,9 +1,0 @@
-# ArmCommand.srv
-string action
-int32[] object_ids
-int32 location
----
-bool success
-int32[] slots
-int32[] object_ids
-string message
