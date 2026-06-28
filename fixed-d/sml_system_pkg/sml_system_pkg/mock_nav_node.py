@@ -1,4 +1,4 @@
-"""
+﻿"""
 mock_nav_node.py
 navigate_to_station Action 서버 mock.
 + /robocup_navigator/post_process (std_srvs/Trigger) 서비스 mock.
@@ -14,7 +14,7 @@ import time
 
 import rclpy
 from rclpy.action import ActionServer
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_srvs.srv import Trigger
@@ -35,7 +35,7 @@ class MockNavNode(Node):
 
     def __init__(self):
         super().__init__('mock_nav_node')
-        self.cbg = ReentrantCallbackGroup()
+        self.cbg = MutuallyExclusiveCallbackGroup()
 
         self.declare_parameter('delay_sec', 1.0)
         self.declare_parameter('use_distance_time', False)

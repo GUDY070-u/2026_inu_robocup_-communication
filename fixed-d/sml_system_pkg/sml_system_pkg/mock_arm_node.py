@@ -1,4 +1,4 @@
-"""
+﻿"""
 mock_arm_node.py
 /amr_robot_command Service 서버 mock.
 
@@ -22,7 +22,7 @@ Plan D 시간 모델:
 import time
 
 import rclpy
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
@@ -48,7 +48,7 @@ class MockArmNode(Node):
 
     def __init__(self):
         super().__init__('mock_arm_node')
-        self.cbg = ReentrantCallbackGroup()
+        self.cbg = MutuallyExclusiveCallbackGroup()
 
         self.declare_parameter('load_time_sec_per_item', 2.0)
         self.declare_parameter('unload_time_sec_per_item', 2.0)
