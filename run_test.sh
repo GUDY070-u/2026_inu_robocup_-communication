@@ -16,7 +16,7 @@
 #   ./run_test.sh                         # 기본값 실행
 #   ./run_test.sh -s 1 -t 3 -g 1 -m 2    # Advanced, random
 
-set -euo pipefail
+set -eo pipefail
 
 # ── 기본값 ──────────────────────────────────────────────────────────────────
 WS="${HOME}/robocup_demo"
