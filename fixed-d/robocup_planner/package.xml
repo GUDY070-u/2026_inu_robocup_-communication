@@ -8,7 +8,7 @@
 
   <depend>rclpy</depend>
   <depend>sml_msgs</depend>
-  <depend>arm_interfaces</depend>
+  <depend>std_msgs</depend>
 
   <exec_depend>python3-yaml</exec_depend>
 
