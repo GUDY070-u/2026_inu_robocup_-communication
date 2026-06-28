@@ -356,7 +356,8 @@ class OrderServer(Node):
 
         auto_publish = bool(self.get_parameter("auto_publish").value)
         if auto_publish:
-            self.publish_task()
+            # Delay publish until after spin() so DDS discovery completes first
+            self._auto_pub_timer = self.create_timer(1.0, self._auto_publish_cb)
         else:
             input("엔터를 누르면 task를 publish합니다 (플래너로 전달): ")
             self.publish_task()
@@ -600,6 +601,10 @@ class OrderServer(Node):
     # ──────────────────────────────────────────────────────────
     # Publish
     # ──────────────────────────────────────────────────────────
+    def _auto_publish_cb(self) -> None:
+        self._auto_pub_timer.cancel()
+        self.publish_task()
+
     def publish_task(self) -> None:
         if self.published:
             return
