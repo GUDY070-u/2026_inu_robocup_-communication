@@ -5,7 +5,7 @@ This file intentionally keeps only ROS subscription/service wiring.
 
 A/B 경기장 대응:
 - Adapter가 넘긴 AMR 실제 station id를 PlannerCore 계산용 station id로 변환한다.
-- side:=b일 때는 9~16을 계산용 1~8로 바꿔 PlannerCore/기존 JSON을 그대로 사용한다.
+- side:=b일 때는 9~17을 계산용 0~8로 바꿔 PlannerCore/기존 JSON을 그대로 사용한다.
 - PlannerCore가 만든 Step은 다시 AMR 실제 station id로 복원한다.
 
 Navigator 비용 반영:
@@ -87,6 +87,10 @@ class PlanningNode(Node):
             waypoint_yaml_path=waypoint_yaml_path,
             nav_align_time_avg=nav_align_time_avg,
             nav_post_time_avg=nav_post_time_avg,
+            fixed_workbench_station_id=amr_station_to_planner_station(
+                self.fixed_workbench_station,
+                self.side,
+            ),
         )
         station_coords = load_station_coord_json(
             config.station_coord_json_path,
@@ -129,8 +133,8 @@ class PlanningNode(Node):
             station_id를 그대로 사용.
 
         side b:
-            Adapter가 만든 AMR station id 9~16을 PlannerCore 계산용 1~8로 변환.
-            예: 15(B 조립로봇) -> 6(A 계산용 조립로봇 좌표)
+            Adapter가 만든 AMR station id 9~17을 PlannerCore 계산용 0~8로 변환.
+            예: 9(B 시작/골) -> 0, 16(B WB 로봇) -> 7.
         """
         if self.side == 'a':
             return task
@@ -163,7 +167,7 @@ class PlanningNode(Node):
         """
         PlannerCore 결과 Step의 station_id를 AMR 실제 station id로 복원.
         side b:
-            6 -> 15, 8 -> 16 등으로 변환.
+            0 -> 9, 6 -> 15, 8 -> 17 등으로 변환.
         """
         if self.side == 'a':
             return steps

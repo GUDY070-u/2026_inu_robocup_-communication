@@ -82,6 +82,7 @@ class PlannerCore:
         self.recycle_step_by_order_index: Dict[int, int] = {}
         self.last_wb_clear_step_id: Optional[int] = None
         self.deferred_waste_jobs: List[dict] = []
+        self.deferred_wb_product_delivery = None
 
         # Rich planner-side inventory metadata.  Step.msg stays compact
         # (object_ids/slide_ids), while this map lets the planner/debug log keep
@@ -134,10 +135,18 @@ class PlannerCore:
         # 2. WB-only production. WB can run while AMR later handles independent work,
         #    but AMR-WB interaction steps are protected by dependencies.
         wb_produces.sort(key=lambda po: len(po['materials']), reverse=True)
-        for produce_order in wb_produces:
-            self._append_wb_produce(produce_order, station_info)
+        for index, produce_order in enumerate(wb_produces):
+            defer_customer_delivery = (
+                bool(amr_produces)
+                and index == len(wb_produces) - 1
+            )
+            self._append_wb_produce(
+                produce_order,
+                station_info,
+                defer_customer_delivery=defer_customer_delivery,
+            )
 
-        # 3. AMR-capable production, using assembly slots 6/7 and raw slides 1~5.
+        # 3. AMR-capable production, using assembly slots 7/8 and raw slides 2~6.
         #    At most two AMR products are prepared together because there are two
         #    assembly slots.
         self._append_amr_produce_batches(amr_produces, station_info)
@@ -454,7 +463,7 @@ class PlannerCore:
             assembly_slide = self._encode_order_slide(order_index, assembly_slot)
             used_slides = [assembly_slide]
 
-            # Base material goes directly to assembly slot 6 or 7.
+            # Base material goes directly to assembly slot 7 or 8.
             base_source = po['sources'][0]
             base_item = self._make_item(
                 object_id=int(materials[0]),
@@ -518,37 +527,18 @@ class PlannerCore:
 
         load_step_ids = self._append_grouped_load_steps(load_items)
 
-        previous_unload = None
+        produce_depends = list(load_step_ids)
+        deferred_wb_delivery = self.deferred_wb_product_delivery
+        if deferred_wb_delivery is not None:
+            produce_depends.append(int(deferred_wb_delivery['load_step_id']))
+
+        product_ids = []
+        produce_slides = []
+        product_items = []
         for runtime in order_runtime:
             po = runtime['order']
-            depends = list(load_step_ids)
-            if previous_unload is not None:
-                depends.append(previous_unload)
-
-            produce_sid = self._add_step(
-                Step.AMR,
-                Step.PRODUCE,
-                [po['product_id']],
-                station_info['customer_id'],
-                depends,
-                runtime['used_slides'],
-                validate_slide_len=False,
-            )
-            produce_items = [
-                self._make_item(
-                    object_id=int(po['product_id']),
-                    slot_index=int(runtime['assembly_slide']) % 10,
-                    slide_id=int(runtime['assembly_slide']),
-                    role=ROLE_PRODUCE_AMR_PRODUCT,
-                    order_index=int(po['order_index']),
-                    order_type='produce',
-                    product_id=int(po['product_id']),
-                    object_kind='product',
-                    target_station=int(station_info['customer_id']),
-                )
-            ]
-            self.step_items[int(produce_sid)] = produce_items
-            self.get_logger().info(f'[AMR ITEM step {produce_sid}] {describe_items(produce_items)}')
+            product_ids.append(int(po['product_id']))
+            produce_slides.extend(int(s) for s in runtime['used_slides'])
             product_item = self._make_item(
                 object_id=int(po['product_id']),
                 slot_index=int(runtime['assembly_slide']) % 10,
@@ -560,16 +550,39 @@ class PlannerCore:
                 object_kind='product',
                 target_station=int(station_info['customer_id']),
             )
-            unload_sid = self._add_step_from_items(
-                Step.AMR,
-                Step.UNLOAD,
-                [product_item],
-                station_info['customer_id'],
-                [produce_sid],
-            )
-            previous_unload = unload_sid
+            product_items.append(product_item)
 
-    def _append_wb_produce(self, po, station_info):
+        produce_sid = self._add_step(
+            Step.AMR,
+            Step.PRODUCE,
+            product_ids,
+            station_info['customer_id'],
+            produce_depends,
+            produce_slides,
+            validate_slide_len=False,
+        )
+        self.step_items[int(produce_sid)] = list(product_items)
+        self.get_logger().info(
+            f'[AMR batch produce] products={product_ids}, slides={produce_slides}, '
+            f'depends_on={self._unique_ints(produce_depends)}'
+        )
+
+        unload_items = list(product_items)
+        unload_depends = [int(produce_sid)]
+        if deferred_wb_delivery is not None:
+            unload_items.insert(0, deferred_wb_delivery['item'])
+            unload_depends.append(int(deferred_wb_delivery['load_step_id']))
+            self.deferred_wb_product_delivery = None
+
+        self._add_step_from_items(
+            Step.AMR,
+            Step.UNLOAD,
+            unload_items,
+            station_info['customer_id'],
+            unload_depends,
+        )
+
+    def _append_wb_produce(self, po, station_info, defer_customer_delivery=False):
         wb_id = station_info['wb_id']
         customer_id = station_info['customer_id']
         order_index = int(po['order_index'])
@@ -654,6 +667,17 @@ class PlannerCore:
         )
         self.last_wb_clear_step_id = product_load_sid
 
+        if defer_customer_delivery:
+            self.deferred_wb_product_delivery = {
+                'item': wb_product_item,
+                'load_step_id': int(product_load_sid),
+            }
+            self.get_logger().info(
+                f'[WB product merge] product={po["product_id"]}, '
+                f'load_step={product_load_sid}: 다음 AMR 생산품과 Customer 공동 하역'
+            )
+            return
+
         self._add_step_from_items(
             Step.AMR,
             Step.UNLOAD,
@@ -669,7 +693,7 @@ class PlannerCore:
           * AMR may LOAD the next recycle product from CUSTOMER while the WB is
             still recycling the previous product.
           * AMR may not UNLOAD to the WB until the previous WB job has finished.
-          * Physical AMR product slots 0/6/7 are protected from double booking.
+          * Physical AMR product slots 1/7/8 are protected from double booking.
 
         This creates the practical pipeline:
             LOAD product i+1 from CUSTOMER  ||  WB RECYCLE product i
@@ -690,7 +714,7 @@ class PlannerCore:
         if self.last_recycle_unload_to_wb_step_id is not None:
             load_depends.append(self.last_recycle_unload_to_wb_step_id)
 
-        # Do not reuse physical slot 5/6/9 until the previous product occupying
+        # Do not reuse physical slot 1/7/8 until the previous product occupying
         # that physical slot has been unloaded to WB.
         slot_free_after = self.recycle_product_slot_free_after.get(int(slot_index))
         if slot_free_after is not None:
@@ -757,12 +781,12 @@ class PlannerCore:
     def _choose_recycle_product_slot(self, ro):
         """Choose physical AMR slot for a recycle product.
 
-        Small recycle products may use assembly slots 6/7.  Large recycle
-        products use product slot 0.  The returned value is the physical slot
+        Small recycle products may use assembly slots 7/8.  Large recycle
+        products use product slot 1.  The returned value is the physical slot
         index; order_index is added later when encoding slide_id.
 
         Since this planner currently uses one-step lookahead preloading, one
-        product is normally carried at a time.  We still track 5/6/9 explicitly
+        product is normally carried at a time.  We still track 1/7/8 explicitly
         so the dependency graph remains safe even if the manager executes every
         ready step aggressively.
         """
@@ -790,8 +814,8 @@ class PlannerCore:
           2. preload the next recycle product from CUSTOMER.
 
         Product preload rule:
-          * first/preferred recycle product uses physical product slot 0;
-          * additional preload is allowed only on physical slots 5/6, only for
+          * first/preferred recycle product uses physical product slot 1;
+          * additional preload is allowed only on physical slots 7/8, only for
             small recycle products, and only when the extra preload is estimated
             not to delay the next WB exchange.
 
@@ -1001,18 +1025,18 @@ class PlannerCore:
         """Preload one or more recycle products from CUSTOMER.
 
         Updated policy:
-          * product slot 0 is the primary slot for a recycle product;
+          * product slot 1 is the primary slot for a recycle product;
           * if a large/non-aux product and a small/aux-capable product are both
-            selected, put the large product in slot 0 and the small product in
-            assembly slot 6/7;
-          * preserve the recycle processing order in loaded_queue even if slot 0
+            selected, put the large product in slot 1 and the small product in
+            assembly slot 7/8;
+          * preserve the recycle processing order in loaded_queue even if slot 1
             is assigned to a later large product.
 
         Example:
           jobs=[241(small), 711(large)]
-          -> LOAD objects=[241,711], slide_ids=[6,10]
+          -> LOAD objects=[241,711], slide_ids=[7,11]
           -> loaded_queue order remains [241,711]
-          -> 241 is unloaded to WB first, 711 waits in slot 0.
+          -> 241 is unloaded to WB first, 711 waits in slot 1.
         """
         if start_index >= len(jobs):
             return start_index, last_amr_step
@@ -1028,9 +1052,9 @@ class PlannerCore:
         #
         # The first job is always required.  Extra jobs are allowed only when
         # they share return targets and pass the WB-slack guard.  Unlike the old
-        # implementation, the first job does not automatically consume slot 0.
+        # implementation, the first job does not automatically consume slot 1.
         # Slot assignment is decided after bundle selection so that a later large
-        # product can use slot 0 while an earlier small product uses 6/7.
+        # product can use slot 1 while an earlier small product uses 7/8.
         # ------------------------------------------------------------------
         selected = [jobs[start_index]]
         next_index = start_index + 1
@@ -1040,11 +1064,11 @@ class PlannerCore:
             candidate = jobs[next_index]
 
             # Additional preload uses assembly slots, therefore only aux-capable
-            # products can be added beyond the product occupying slot 0.  There is
+            # products can be added beyond the product occupying slot 1.  There is
             # one exception: if the already-selected first job is aux-capable and
             # no slot-0 product has been selected yet, a following large product
             # may be selected as the slot-0 product.  This is the case the user
-            # pointed out: 241 can ride in slot 6/7 while 711 rides in slot 0.
+            # pointed out: 241 can ride in slot 7/8 while 711 rides in slot 1.
             selected_has_large = any(not self._can_use_recycle_aux_slot(j) for j in selected)
             selected_aux_count = sum(1 for j in selected if self._can_use_recycle_aux_slot(j))
             aux_capacity_left = len(ASSEMBLY_SLOT_INDICES) - selected_aux_count
@@ -1056,7 +1080,7 @@ class PlannerCore:
                 can_add_candidate = True
             elif (not candidate_is_aux) and (not selected_has_large):
                 # Allow exactly one large/non-aux product to join the bundle; it
-                # will be assigned to product slot 0.
+                # will be assigned to product slot 1.
                 can_add_candidate = True
 
             if not can_add_candidate:
@@ -1064,7 +1088,7 @@ class PlannerCore:
 
             # Prefer grouped products whose return stations overlap.  For the
             # special case where the first selected job is small and the next is
-            # large, allow it even if overlap is zero, because using slot 0 for the
+            # large, allow it even if overlap is zero, because using slot 1 for the
             # large product avoids an unnecessary second customer trip.
             overlap = self._target_overlap_count(anchor_counts, candidate['target_counts'])
             special_large_after_small = (
@@ -1089,10 +1113,10 @@ class PlannerCore:
         # ------------------------------------------------------------------
         # 2) Assign physical slots while preserving processing order.
         #
-        # If any selected product must use slot 0, assign slot 0 to the first
+        # If any selected product must use slot 1, assign slot 1 to the first
         # non-aux product in the selected bundle.  Earlier small jobs are assigned
         # to 6/7, so they can still be processed first.
-        # If all selected products are small, the first one may use slot 0 and
+        # If all selected products are small, the first one may use slot 1 and
         # the rest use 6/7.
         # ------------------------------------------------------------------
         if int(PRODUCT_SLOT_INDEX) in occupied_slots:
@@ -1179,9 +1203,9 @@ class PlannerCore:
         return next_index, int(load_sid)
 
     def _can_use_recycle_aux_slot(self, job):
-        # Assembly slots 6/7 are reserved for additional preload.  Keep this
+        # Assembly slots 7/8 are reserved for additional preload.  Keep this
         # conservative: only small products whose decomposed raw size is 1-unit
-        # materials may use 6/7.  Large products wait for product slot 0.
+        # materials may use 7/8.  Large products wait for product slot 1.
         pseudo_order = {'materials': list(job.get('materials', []))}
         return self._is_small_recycle(pseudo_order)
 
@@ -1365,7 +1389,7 @@ class PlannerCore:
         Strategy used here:
         1. Collect all leftover recycle results first.
         2. Assign each raw material to a return target station.
-        3. Pack as many materials as possible into each AMR trip using raw slides 1~5
+        3. Pack as many materials as possible into each AMR trip using raw slides 2~6
            and slide capacity 3 units.
         4. If everything fits in one trip, visit stations in the order:
               close to WB and far from GOAL  ->  close to GOAL
@@ -1524,7 +1548,7 @@ class PlannerCore:
         rest = []
 
         # Try WB-near/GOAL-far materials first.  Keep adding while the whole trip
-        # remains physically packable in raw slides 0~4.
+        # remains physically packable in raw slides 2~6.
         ordered = sorted(
             remaining,
             key=lambda item: (
@@ -1634,12 +1658,12 @@ class PlannerCore:
     def _local_station_id_for_slide(self, station_id):
         """Use local 1~8 station number inside negative return slide IDs.
 
-        A side stations are already 1~8.  B side stations are 9~16, so the local
-        station number is station_id - 8.
+        A side stations are already 1~8.  B side stations are 10~17, so the local
+        station number is station_id - 9.
         """
         station_id = int(station_id)
-        if 9 <= station_id <= 16:
-            return station_id - 8
+        if 10 <= station_id <= 17:
+            return station_id - 9
         return station_id
 
     def _append_grouped_load_steps(self, load_items):

@@ -41,6 +41,17 @@ from rclpy.node import Node
 from sml_msgs.msg import Task, Step
 from sml_msgs.srv import GetPlan
 
+from .arena_side_utils import (
+    amr_station_to_planner_station,
+    side_to_start_goal_station,
+)
+from .planning.planner_config import (
+    AMR_SLOT_INDICES,
+    ASSEMBLY_SLOT_INDICES,
+    PRODUCT_SLOT_INDEX,
+    RAW_SLOT_INDICES,
+)
+
 try:
     import tkinter as tk
     from tkinter import ttk, messagebox
@@ -96,14 +107,9 @@ STATION_TYPE_NAMES = {1: "Storage", 2: "Workbench", 3: "Customer", 4: "Hybrid"}
 STEP_TYPE_NAMES = {0: "AMR", 1: "WB"}
 STEP_ACTION_NAMES = {0: "LOAD", 1: "UNLOAD", 2: "PRODUCE", 3: "RECYCLE", 4: "GOAL"}
 SLOT_LABELS = {
-    0: "0 Product",
-    1: "1 Raw",
-    2: "2 Raw",
-    3: "3 Raw",
-    4: "4 Raw",
-    5: "5 Raw",
-    6: "6 Assembly",
-    7: "7 Assembly",
+    PRODUCT_SLOT_INDEX: f"{PRODUCT_SLOT_INDEX} Product",
+    **{slot: f"{slot} Raw" for slot in RAW_SLOT_INDICES},
+    **{slot: f"{slot} Assembly" for slot in ASSEMBLY_SLOT_INDICES},
 }
 
 
@@ -140,7 +146,9 @@ class VirtualState:
     station_items: Dict[int, List[int]] = field(default_factory=dict)
     station_names: Dict[int, str] = field(default_factory=dict)
     station_types: Dict[int, int] = field(default_factory=dict)
-    amr_slots: Dict[int, List[SlotObject]] = field(default_factory=lambda: {i: [] for i in range(8)})
+    amr_slots: Dict[int, List[SlotObject]] = field(
+        default_factory=lambda: {i: [] for i in AMR_SLOT_INDICES}
+    )
     wb_items: Dict[int, List[int]] = field(default_factory=dict)
     batch_remaining: Dict[Tuple[int, int], int] = field(default_factory=dict)
     amr_station: int = 0
@@ -152,7 +160,7 @@ class VirtualState:
         self.station_types.clear()
         self.wb_items.clear()
         self.batch_remaining.clear()
-        self.amr_slots = {i: [] for i in range(8)}
+        self.amr_slots = {i: [] for i in AMR_SLOT_INDICES}
         self.amr_station = 0
         self.wb_status = "idle"
 
@@ -261,6 +269,7 @@ class SmlGuiNode(Node):
         self.current_task: Optional[Task] = None
         self.steps: List[Step] = []
         self.state = VirtualState()
+        self.state.amr_station = side_to_start_goal_station(self.side)
         self.applied_step_ids: set[int] = set()
         self.next_apply_index = 0
 
@@ -406,6 +415,7 @@ class SmlGuiNode(Node):
         self.applied_step_ids.clear()
         self.next_apply_index = 0
         self.state.clone_from_task(task)
+        self.state.amr_station = side_to_start_goal_station(self.side)
         self.status_var.set(
             f"Task 수신: orders={len(task.order_list)}, stations={len(task.arena_layout)} | GetPlan 요청 가능"
         )
@@ -451,6 +461,7 @@ class SmlGuiNode(Node):
     def reset_virtual_state(self, redraw: bool = True) -> None:
         if self.current_task is not None:
             self.state.clone_from_task(self.current_task)
+            self.state.amr_station = side_to_start_goal_station(self.side)
         self.applied_step_ids.clear()
         self.next_apply_index = 0
         if redraw:
@@ -506,7 +517,7 @@ class SmlGuiNode(Node):
             elif action == 2:  # AMR PRODUCE
                 self._state_amr_produce(objects, slides)
             elif action == 4:  # GOAL
-                self.state.amr_station = 0
+                self.state.amr_station = side_to_start_goal_station(self.side)
         elif step_type == 1:  # WB
             if action == 2:  # PRODUCE complete
                 for obj in objects:
@@ -579,7 +590,7 @@ class SmlGuiNode(Node):
 
     def _state_amr_load(self, station_id: int, objects: List[int], slides: List[int]) -> None:
         if not slides:
-            slides = [0 for _ in objects]
+            slides = [PRODUCT_SLOT_INDEX for _ in objects]
         for obj, slide in zip(objects, slides):
             _, slot, _ = decode_slide_id(int(slide))
             if slot not in self.state.amr_slots:
@@ -595,7 +606,7 @@ class SmlGuiNode(Node):
 
     def _state_amr_unload(self, station_id: int, objects: List[int], slides: List[int]) -> None:
         if not slides:
-            slides = [0 for _ in objects]
+            slides = [PRODUCT_SLOT_INDEX for _ in objects]
         station_id = int(station_id)
         self.state.station_items.setdefault(station_id, [])
         for obj, slide in zip(objects, slides):
@@ -607,19 +618,31 @@ class SmlGuiNode(Node):
     def _state_amr_produce(self, objects: List[int], slides: List[int]) -> None:
         if not objects:
             return
-        product_id = int(objects[0])
-        if slides:
-            _, slot, _ = decode_slide_id(int(slides[0]))
-            used_slots = [decode_slide_id(int(s))[1] for s in slides]
-            out_slide = int(slides[0])
-        else:
-            slot = 6
-            used_slots = []
-            out_slide = slot
-        for us in used_slots:
-            if us in self.state.amr_slots:
-                self.state.amr_slots[us].clear()
-        self.state.amr_slots.setdefault(slot, []).append(SlotObject(product_id, out_slide, object_label(product_id)))
+
+        slide_offset = 0
+        for product_index, raw_product_id in enumerate(objects):
+            product_id = int(raw_product_id)
+            input_count = max(1, len(recipe(product_id)))
+            product_slides = list(slides[slide_offset:slide_offset + input_count])
+            slide_offset += input_count
+
+            if product_slides:
+                out_slide = int(product_slides[0])
+                _, slot, _ = decode_slide_id(out_slide)
+                used_slots = [decode_slide_id(int(s))[1] for s in product_slides]
+            else:
+                slot = ASSEMBLY_SLOT_INDICES[
+                    min(product_index, len(ASSEMBLY_SLOT_INDICES) - 1)
+                ]
+                used_slots = []
+                out_slide = slot
+
+            for used_slot in used_slots:
+                if used_slot in self.state.amr_slots:
+                    self.state.amr_slots[used_slot].clear()
+            self.state.amr_slots.setdefault(slot, []).append(
+                SlotObject(product_id, out_slide, object_label(product_id))
+            )
 
     def _state_wb_produce_complete(self, station_id: int, product_id: int) -> None:
         station_id = int(station_id)
@@ -688,10 +711,14 @@ class SmlGuiNode(Node):
 
     def _refresh_state_tables(self) -> None:
         self.slot_tree.delete(*self.slot_tree.get_children())
-        for slot in range(8):
+        for slot in AMR_SLOT_INDICES:
             objs = self.state.amr_slots.get(slot, [])
             contents = "; ".join(f"{o.object_id}@{slide_label(o.slide_id)}" for o in objs) or "empty"
-            slot_type = "Product" if slot == 0 else "Raw slide" if 1 <= slot <= 5 else "Assembly"
+            slot_type = (
+                "Product" if slot == PRODUCT_SLOT_INDEX
+                else "Raw slide" if slot in RAW_SLOT_INDICES
+                else "Assembly"
+            )
             self.slot_tree.insert("", "end", values=(slot, slot_type, contents))
 
         self.station_tree.delete(*self.station_tree.get_children())
@@ -714,7 +741,7 @@ class SmlGuiNode(Node):
         """One-zone coordinates arranged to resemble the official arena figure.
 
         The visible zone is 5.0 m × 7.5 m. A-side and B-side are drawn with the
-        same local layout; B station IDs 9~16 are converted to local 1~8 by
+        same local layout; B station IDs 9~17 are converted to local 0~8 by
         _coord_for_station().
         """
         self.map_width_m = 5.0
@@ -726,7 +753,7 @@ class SmlGuiNode(Node):
             2: "STORAGE_2",
             3: "WORKBENCH_1",
             4: "STORAGE_3",
-            5: "HYBRID_1",
+            5: "STORAGE_4",
             6: "WORKBENCH_2",
             7: "WORKBENCH_3",
             8: "CUSTOMER_1",
@@ -817,12 +844,12 @@ class SmlGuiNode(Node):
         }
 
     def _coord_for_station(self, sid: int) -> Tuple[float, float]:
-        # GUI uses one active zone. B-side station IDs are converted to local 1~8
-        # unless the JSON explicitly provides global 9~16 coordinates.
+        # GUI uses one active zone. B-side station IDs are converted to local 0~8
+        # unless the JSON explicitly provides global 9~17 coordinates.
         sid = int(sid)
         if sid in self.station_coords:
             return self.station_coords[sid]
-        local = sid - 8 if sid >= 9 else sid
+        local = amr_station_to_planner_station(sid, self.side)
         if local in self.station_coords:
             return self.station_coords[local]
         return self._default_station_coords().get(local, (self.map_width_m / 2.0, self.map_height_m / 2.0))
@@ -971,10 +998,10 @@ class SmlGuiNode(Node):
         if panel_w < 160:
             return
         row_h = 23
-        panel_h = 8 * row_h + 30
+        panel_h = len(AMR_SLOT_INDICES) * row_h + 30
         c.create_rectangle(x, y, x + panel_w, y + panel_h, fill="#ffffff", outline="#bbbbbb")
         c.create_text(x + 8, y + 14, text="AMR cargo slots", anchor="w", font=("Arial", 10, "bold"))
-        for idx, slot in enumerate(range(8)):
+        for idx, slot in enumerate(AMR_SLOT_INDICES):
             y0 = y + 28 + idx * row_h
             c.create_rectangle(x + 6, y0, x + panel_w - 6, y0 + row_h - 3, outline="#cccccc", fill="#fafafa")
             label = SLOT_LABELS.get(slot, str(slot))
@@ -1070,7 +1097,8 @@ class SmlGuiNode(Node):
             if bx0 <= gx <= bx1 and by0 <= gy <= by1:
                 grx, gry = sx(gx), sy(gy)
                 c.create_rectangle(grx - 40, gry - 28, grx + 40, gry + 28, outline="#ff1744", dash=(3, 2), width=2, fill="#fff8e1")
-                c.create_text(grx, gry, text="GOAL\n0", font=("Arial", 8, "bold"), fill="#d50000")
+                goal_station = side_to_start_goal_station(self.side)
+                c.create_text(grx, gry, text=f"GOAL\n{goal_station}", font=("Arial", 8, "bold"), fill="#d50000")
 
         # Draw stations from task, otherwise from known coords 1..8.
         stations = sorted(self.state.station_items.keys()) if self.state.station_items else [sid for sid in sorted(self.station_coords) if sid != 0]
@@ -1083,7 +1111,10 @@ class SmlGuiNode(Node):
             self._draw_station_box(c, sid, sx(x), sy(y))
 
         # Draw AMR at virtual current station.
-        if self.state.amr_station == 0 and 0 in self.station_coords:
+        if (
+            self.state.amr_station == side_to_start_goal_station(self.side)
+            and 0 in self.station_coords
+        ):
             ax, ay = self.station_coords[0]
         else:
             ax, ay = self._coord_for_station(self.state.amr_station)

@@ -5,9 +5,9 @@ metadata here and converts it to Step.object_ids / Step.slide_ids only at the
 last step-generation boundary.
 
 Current physical slot convention:
-    slot 0   : product / recycle-product default slot
-    slot 1-5 : raw material slides
-    slot 6-7 : AMR assembly slots / auxiliary recycle-product preload slots
+    slot 1   : product / recycle-product default slot
+    slot 2-6 : raw material slides
+    slot 7-8 : AMR assembly slots / auxiliary recycle-product preload slots
 """
 
 from __future__ import annotations
@@ -15,15 +15,20 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from .planner_config import (
+    ASSEMBLY_SLOT_INDICES,
+    PRODUCT_SLOT_INDEX,
+    RAW_SLIDE_CAPACITY_UNITS,
+    RAW_SLOT_INDICES,
+)
 
 # ---------------------------------------------------------------------------
 # Slot constants
 # ---------------------------------------------------------------------------
 
-PRODUCT_SLOT = 0
-RAW_SLIDE_SLOTS = (1, 2, 3, 4, 5)
-ASSEMBLY_SLOTS = (6, 7)
-RAW_SLIDE_CAPACITY_UNITS = 3
+PRODUCT_SLOT = PRODUCT_SLOT_INDEX
+RAW_SLIDE_SLOTS = tuple(RAW_SLOT_INDICES)
+ASSEMBLY_SLOTS = tuple(ASSEMBLY_SLOT_INDICES)
 
 
 # ---------------------------------------------------------------------------

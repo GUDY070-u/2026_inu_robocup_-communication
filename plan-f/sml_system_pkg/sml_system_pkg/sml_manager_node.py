@@ -6,8 +6,7 @@ depends_on 기반으로 AMR / WB를 병렬 실행하는 노드.
 A/B 경기장 대응:
   - side:=a 또는 side:=b 파라미터 사용
   - 일반 station은 Step.station_id를 그대로 AMR에 전달
-  - GOAL/복귀 station_id=0은 navigator goal 타입이 string이면 "a"/"b"로 전달
-  - navigator goal 타입이 int32이면 현재 인터페이스 한계상 0을 유지하고 경고 로그를 출력
+  - GOAL/복귀 station_id는 A면 0, B면 9를 사용
 """
 
 import threading
@@ -29,7 +28,9 @@ from sml_msgs.srv import ArmCommand, GetPlan
 from sml_system_pkg.arena_side_utils import (
     normalize_side,
     nav_target_for_station,
+    side_to_fixed_workbench_station,
 )
+from sml_system_pkg.planning.planner_config import RAW_SLOT_INDICES
 
 
 class SmlManagerNode(Node):
@@ -44,6 +45,7 @@ class SmlManagerNode(Node):
         self.completed_steps = set()    # 완료된 step_id 집합
         self.amr_busy        = False    # AMR 트랙 점유 여부
         self.wb_busy         = False    # WB 트랙 점유 여부
+        self.wb_reserved_by_amr = None  # WB 접근을 예약한 AMR step_id
         self.plan_requested  = False    # GetPlan 요청 여부 (중복 방지)
 
         # Plan C: AMR PRODUCE는 이동과 AMR 내부 조립이 동시에 진행된다.
@@ -55,7 +57,7 @@ class SmlManagerNode(Node):
         # The physical AMR arm expects raw-slide ids in the form
         #     raw_slide_no * 10 + pick_position
         # for raw slides. Product/assembly slots are sent as their physical slot number.
-        self._arm_raw_slot_indices = [2, 3, 4, 5, 6]
+        self._arm_raw_slot_indices = list(RAW_SLOT_INDICES)
         self._arm_raw_slots = {
             slot: {'units': [None, None, None], 'items': {}}
             for slot in self._arm_raw_slot_indices
@@ -80,6 +82,7 @@ class SmlManagerNode(Node):
 
         self.declare_parameter('side', 'a')
         self.side = normalize_side(self.get_parameter('side').value)
+        self.fixed_workbench_station = side_to_fixed_workbench_station(self.side)
 
         self.declare_parameter(
             'post_process_service_name',
@@ -170,6 +173,7 @@ class SmlManagerNode(Node):
             self.completed_steps.clear()
             self.amr_busy = False
             self.wb_busy = False
+            self.wb_reserved_by_amr = None
 
             # 새 계획 기준으로 시간 측정값 초기화
             self.step_start_times.clear()
@@ -216,11 +220,19 @@ class SmlManagerNode(Node):
 
                 if step.type == Step.AMR and not self.amr_busy \
                         and amr_step is None:
+                    needs_wb = self._is_amr_wb_interaction(step)
+                    if needs_wb and (
+                        self.wb_busy or self.wb_reserved_by_amr is not None
+                    ):
+                        continue
                     self.amr_busy = True
+                    if needs_wb:
+                        self.wb_reserved_by_amr = int(step.step_id)
                     self.pending_steps.remove(step)
                     amr_step = step
 
                 elif step.type == Step.WB and not self.wb_busy \
+                        and self.wb_reserved_by_amr is None \
                         and wb_step is None:
                     self.wb_busy = True
                     self.pending_steps.remove(step)
@@ -265,6 +277,20 @@ class SmlManagerNode(Node):
             self._log_step_duration_summary()
             self._publish_status('완료')
 
+    def _is_amr_wb_interaction(self, step):
+        return (
+            int(step.type) == int(Step.AMR)
+            and int(step.action) in (int(Step.LOAD), int(Step.UNLOAD))
+            and int(step.station_id) == int(self.fixed_workbench_station)
+        )
+
+    def _set_amr_idle(self, step):
+        """Release the AMR track and any WB access reservation held by this step."""
+        with self._lock:
+            self.amr_busy = False
+            if self.wb_reserved_by_amr == int(step.step_id):
+                self.wb_reserved_by_amr = None
+
     def _on_step_complete(self, step_id):
         with self._lock:
             now = time.monotonic()
@@ -308,9 +334,8 @@ class SmlManagerNode(Node):
         """
         navigator goal에 target을 넣는다.
 
-        - station_id == 0이면 side별로 "a"/"b"를 목표로 사용한다.
-        - NavTask.Goal.station_id가 string 타입이면 "a"/"b"를 그대로 넣는다.
-        - NavTask.Goal.station_id가 int 타입이면 인터페이스 한계상 0을 넣고 경고한다.
+        - A면/B면 start/goal을 포함해 숫자 station_id를 그대로 사용한다.
+        - NavTask.Goal.station_id가 string 타입이면 숫자를 문자열로 변환한다.
         - goal에 location/target/station_name 같은 string 필드가 있으면 함께 채운다.
         """
         nav_target = nav_target_for_station(int(station_id), self.side)
@@ -319,25 +344,16 @@ class SmlManagerNode(Node):
         # 보조 문자열 필드가 존재하면 채움
         for string_field in ('location', 'target', 'station_name', 'station_label'):
             if string_field in field_types and field_types[string_field] == 'string':
-                setattr(goal, string_field, nav_target)
+                setattr(goal, string_field, str(nav_target))
 
         if 'station_id' in field_types:
             station_id_type = field_types['station_id']
 
             if station_id_type == 'string':
-                goal.station_id = nav_target
+                goal.station_id = str(nav_target)
                 return nav_target
 
-            # int 계열 station_id
-            if nav_target in ('a', 'b'):
-                self.get_logger().warn(
-                    '[NAV] NavTask.Goal.station_id가 숫자 타입입니다. '
-                    f'복귀 label={nav_target}를 직접 넣을 수 없어 station_id=0으로 전송합니다. '
-                    'navigator에서 side 파라미터로 0을 a/b home으로 해석해야 합니다.'
-                )
-                goal.station_id = 0
-            else:
-                goal.station_id = int(nav_target)
+            goal.station_id = int(nav_target)
             return nav_target
 
         # station_id 필드가 없고 target/location만 있는 경우
@@ -357,8 +373,7 @@ class SmlManagerNode(Node):
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error(
                 f'[NAV] step {step.step_id}: nav 서버 없음')
-            with self._lock:
-                self.amr_busy = False
+            self._set_amr_idle(step)
             return
 
         goal = NavTask.Goal()
@@ -377,8 +392,7 @@ class SmlManagerNode(Node):
         if not goal_handle.accepted:
             self.get_logger().error(
                 f'[NAV] step {step.step_id} goal 거절됨')
-            with self._lock:
-                self.amr_busy = False
+            self._set_amr_idle(step)
             return
 
         result_future = goal_handle.get_result_async()
@@ -399,8 +413,7 @@ class SmlManagerNode(Node):
             else:
                 self.get_logger().error(
                     f'[NAV] step {step.step_id} 최종 실패')
-                with self._lock:
-                    self.amr_busy = False
+                self._set_amr_idle(step)
             return
 
         self.get_logger().info(
@@ -409,8 +422,7 @@ class SmlManagerNode(Node):
         if step.action == Step.GOAL:
             self.get_logger().info(
                 f'[NAV] step {step.step_id} GOAL 도착 → ARM 생략, 완료 처리')
-            with self._lock:
-                self.amr_busy = False
+            self._set_amr_idle(step)
             self._on_step_complete(step.step_id)
             return
 
@@ -434,15 +446,13 @@ class SmlManagerNode(Node):
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error(
                 f'[AMR PRODUCE] step {step.step_id}: nav 서버 없음')
-            with self._lock:
-                self.amr_busy = False
+            self._set_amr_idle(step)
             return
 
         if not self.arm_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().error(
                 f'[AMR PRODUCE] step {step.step_id}: arm 서비스 없음')
-            with self._lock:
-                self.amr_busy = False
+            self._set_amr_idle(step)
             return
 
         goal = NavTask.Goal()
@@ -716,7 +726,14 @@ class SmlManagerNode(Node):
 
         for idx, sid in enumerate(logical_slide_ids):
             slot_index = self._logical_slot_index(sid)
-            object_id = object_ids[idx] if idx < len(object_ids) else None
+            # PRODUCE object_ids are output product IDs, not input raw IDs.
+            # Look up each input by logical slide so batched products are handled
+            # without falsely matching a product ID to a raw slot.
+            object_id = (
+                None
+                if action_name == 'PRODUCE'
+                else object_ids[idx] if idx < len(object_ids) else None
+            )
 
             if self._is_raw_slot_index(slot_index):
                 if action_name == 'LOAD':
@@ -910,8 +927,7 @@ class SmlManagerNode(Node):
         if not self.arm_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().error(
                 f'[ARM] step {step.step_id}: arm 서비스 없음')
-            with self._lock:
-                self.amr_busy = False
+            self._set_amr_idle(step)
             return
 
         req = ArmCommand.Request()
@@ -925,8 +941,7 @@ class SmlManagerNode(Node):
         else:
             self.get_logger().error(
                 f'[ARM] step {step.step_id}: 지원하지 않는 action={step.action}')
-            with self._lock:
-                self.amr_busy = False
+            self._set_amr_idle(step)
             return
 
         req.object_ids = list(step.object_ids)
@@ -951,8 +966,7 @@ class SmlManagerNode(Node):
         except Exception as e:
             self.get_logger().error(
                 f'[ARM] step {step.step_id} 예외: {e}')
-            with self._lock:
-                self.amr_busy = False
+            self._set_amr_idle(step)
             return
 
         if not response.success:
@@ -966,8 +980,7 @@ class SmlManagerNode(Node):
             else:
                 self.get_logger().error(
                     f'[ARM] step {step.step_id} 최종 실패')
-                with self._lock:
-                    self.amr_busy = False
+                self._set_amr_idle(step)
             return
 
         self.get_logger().info(
@@ -982,8 +995,7 @@ class SmlManagerNode(Node):
         if not self.post_process_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().error(
                 f'[POST] step {step.step_id}: post_process 서비스 없음')
-            with self._lock:
-                self.amr_busy = False
+            self._set_amr_idle(step)
             return
 
         self.get_logger().info(
@@ -1008,8 +1020,7 @@ class SmlManagerNode(Node):
                     f'({retry+1}/{MAX_RETRY})')
                 self._execute_nav_post_process(step, retry + 1)
             else:
-                with self._lock:
-                    self.amr_busy = False
+                self._set_amr_idle(step)
             return
 
         if not response.success:
@@ -1021,12 +1032,13 @@ class SmlManagerNode(Node):
                     f'({retry+1}/{MAX_RETRY})')
                 self._execute_nav_post_process(step, retry + 1)
             else:
-                with self._lock:
-                    self.amr_busy = False
+                self._set_amr_idle(step)
             return
 
         self.get_logger().info(f'[POST] step {step.step_id} 완료')
         with self._lock:
+            if self.wb_reserved_by_amr == int(step.step_id):
+                self.wb_reserved_by_amr = None
             self.amr_busy = False
             self._amr_produce_states.pop(int(step.step_id), None)
         self._on_step_complete(step.step_id)

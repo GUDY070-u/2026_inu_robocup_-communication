@@ -21,6 +21,12 @@ from std_srvs.srv import Trigger
 
 from sml_msgs.action import NavTask
 
+from sml_system_pkg.arena_side_utils import (
+    amr_station_to_planner_station,
+    normalize_side,
+    side_to_start_goal_station,
+)
+
 DEFAULT_STATION_COORD_JSON_PATH = (
     '/home/user/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
 )
@@ -37,10 +43,17 @@ class MockNavNode(Node):
         self.declare_parameter('amr_speed_mps', 0.50)
         self.declare_parameter('nav_overhead_sec', 0.0)
         self.declare_parameter('post_process_delay_sec', 0.0)
-        self.declare_parameter('start_station_id', 0)
+        self.declare_parameter('side', 'a')
+        self.declare_parameter('start_station_id', -1)
         self.declare_parameter('station_coord_json_path', DEFAULT_STATION_COORD_JSON_PATH)
 
-        self.current_station_id = int(self.get_parameter('start_station_id').value)
+        self.side = normalize_side(self.get_parameter('side').value)
+        configured_start = int(self.get_parameter('start_station_id').value)
+        self.current_station_id = (
+            side_to_start_goal_station(self.side)
+            if configured_start < 0
+            else configured_start
+        )
         self.station_coords = self._load_station_coords()
 
         self._action_server = ActionServer(
@@ -52,6 +65,7 @@ class MockNavNode(Node):
         )
         self.get_logger().info(
             '[MOCK NAV] navigate_to_station 서버 시작 | '
+            f'side={self.side}, start={self.current_station_id}, '
             f'use_distance_time={bool(self.get_parameter("use_distance_time").value)}, '
             f'fixed_delay={float(self.get_parameter("delay_sec").value):.2f}s, '
             f'speed={float(self.get_parameter("amr_speed_mps").value):.2f}m/s'
@@ -91,6 +105,9 @@ class MockNavNode(Node):
         station_id = int(station_id)
         if station_id in self.station_coords:
             return self.station_coords[station_id]
+        local_station_id = amr_station_to_planner_station(station_id, self.side)
+        if local_station_id in self.station_coords:
+            return self.station_coords[local_station_id]
         return (float(station_id), 0.0)
 
     def _travel_delay(self, target_station_id: int) -> float:

@@ -1,9 +1,9 @@
 """Plan D planner constants and runtime configuration.
 
 Slot convention used by Step.slide_ids:
-    slot 0   : product / recycle-product default slot
-    slot 1-5 : raw material slides
-    slot 6-7 : AMR assembly slots / recycle auxiliary preload slots
+    slot 1   : product / recycle-product default slot
+    slot 2-6 : raw material slides
+    slot 7-8 : AMR assembly slots / recycle auxiliary preload slots
 """
 
 from dataclasses import dataclass
@@ -48,10 +48,11 @@ BATCH_SIZE = 5
 STATION_START_GOAL = 0
 FIXED_WORKBENCH_STATION_ID = 6
 
-# Latest AMR internal slot convention.
-PRODUCT_SLOT_INDEX = 0
-RAW_SLOT_INDICES = [1, 2, 3, 4, 5]
-ASSEMBLY_SLOT_INDICES = [6, 7]
+# AMR physical slots are numbered from 1.
+PRODUCT_SLOT_INDEX = 1
+RAW_SLOT_INDICES = [2, 3, 4, 5, 6]
+ASSEMBLY_SLOT_INDICES = [7, 8]
+AMR_SLOT_INDICES = [PRODUCT_SLOT_INDEX, *RAW_SLOT_INDICES, *ASSEMBLY_SLOT_INDICES]
 RAW_SLIDE_CAPACITY_UNITS = 3
 
 # Backward-compatible aliases.

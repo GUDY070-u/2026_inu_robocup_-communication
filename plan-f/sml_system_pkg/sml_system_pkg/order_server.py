@@ -6,7 +6,8 @@
 
 주요 정책
 - station_name은 공식 이름(side_a_storage_1 등)을 유지한다.
-- 선택한 start_side에 따라 A면 station_id 1~8, B면 station_id 9~16으로 발행한다.
+- 선택한 start_side에 따라 A면 station_id 1~8, B면 station_id 10~17로 발행한다.
+- start/goal은 A면 0, B면 9이다.
 - 공식 Beginner preset의 batch ID(10, 30, 40 등)는 그대로 유지한다.
 - 랜덤 모드에서도 같은 원재료 2개를 batch로 임의 압축하지 않는다.
 - batch는 arena_layout에 들어갈 수 있고, planner가 raw 단위로 해석해야 한다.
@@ -102,14 +103,15 @@ STAGE_NAMES = {1: "production", 2: "recycling", 3: "lifecycle"}
 # Station naming / ID mapping
 #   local station: 1~8
 #   A actual ID: 1~8
-#   B actual ID: 9~16
+#   B actual ID: 10~17
+#   start/goal: A=0, B=9
 # ─────────────────────────────────────────────────────────────
 STATION_DEFS = [
     ("storage_1", 1, ST_STORAGE),
     ("storage_2", 2, ST_STORAGE),
     ("workbench_1", 3, ST_WORKBENCH),
     ("storage_3", 4, ST_STORAGE),
-    ("hybrid_1", 5, ST_HYBRID),
+    ("storage_4", 5, ST_STORAGE),
     ("workbench_2", 6, ST_WORKBENCH),
     ("workbench_3", 7, ST_WORKBENCH),
     ("customer_1", 8, ST_CUSTOMER),
@@ -132,7 +134,7 @@ def side_prefix(side: str) -> str:
 
 
 def station_offset(side: str) -> int:
-    return 0 if normalize_side(side) == "a" else 8
+    return 0 if normalize_side(side) == "a" else 9
 
 
 def make_order(order_type: int, _name: str, product_id: int) -> Order:
@@ -208,10 +210,10 @@ def build_recycling_beginner_task(start_side: str) -> Task:
         {
             "side_a_storage_1": [1, 3],
             "side_a_storage_3": [4],
-            "side_a_hybrid_1": [2],
+            "side_a_storage_4": [2],
             "side_b_storage_1": [1, 3],
             "side_b_storage_3": [4],
-            "side_b_hybrid_1": [2],
+            "side_b_storage_4": [2],
         },
         start_side,
     )
@@ -231,12 +233,12 @@ def build_lifecycle_beginner_task(start_side: str) -> Task:
             "side_a_storage_1": [10, 2],
             "side_a_storage_2": [4, 30],
             "side_a_storage_3": [6],
-            "side_a_hybrid_1": [7],
+            "side_a_storage_4": [7],
             "side_a_customer_1": [34, 442],
             "side_b_storage_1": [10, 2],
             "side_b_storage_2": [4, 30],
             "side_b_storage_3": [6],
-            "side_b_hybrid_1": [7],
+            "side_b_storage_4": [7],
             "side_b_customer_1": [34, 442],
         },
         start_side,
@@ -470,12 +472,12 @@ class OrderServer(Node):
         prefix = side_prefix(self.start_side)
         material_map: Dict[str, List[int]] = {}
 
-        # 공식 예시처럼 storage_1, storage_2, storage_3, hybrid_1을 재료 공급 후보로 사용한다.
+        # storage_1~4를 재료 공급 후보로 사용한다.
         supply_station_names = [
             f"{prefix}_storage_1",
             f"{prefix}_storage_2",
             f"{prefix}_storage_3",
-            f"{prefix}_hybrid_1",
+            f"{prefix}_storage_4",
         ]
         buckets = split_round_robin(storage_materials, len(supply_station_names))
         for name, bucket in zip(supply_station_names, buckets):

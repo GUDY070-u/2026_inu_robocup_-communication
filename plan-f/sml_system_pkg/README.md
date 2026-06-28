@@ -2,6 +2,10 @@
 
 Plan D system package for RoboCup SML.
 
+## Documentation
+
+- [경기별 적재·하역 로직](docs/경기별_적재_하역_로직.md)
+
 ## What this planner does
 
 - Uses `sml_msgs`.
@@ -10,9 +14,9 @@ Plan D system package for RoboCup SML.
 - Uses WB only for products `{8518, 48132, 46262}` and recycle tasks.
 - Uses slide IDs:
   - `order_index * 10 + slot_index`
-  - raw slides: `0~4`
-  - assembly slots: `5, 6`
-  - product slot: `9`
+  - product slot: `1`
+  - raw slides: `2~6`
+  - assembly slots: `7, 8`
   - return-to-storage: `-(local_station_id * 10 + slot_index)`
 - Enforces raw slide capacity 3 units and prevents the same order from using the same raw slide twice.
 - Keeps AMR from interacting with the WB while the WB is active by step dependencies.
