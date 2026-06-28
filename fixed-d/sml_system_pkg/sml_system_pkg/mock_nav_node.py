@@ -21,9 +21,14 @@ from std_srvs.srv import Trigger
 
 from sml_msgs.action import NavTask
 
-DEFAULT_STATION_COORD_JSON_PATH = (
-    '/home/user/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
-)
+try:
+    from ament_index_python.packages import get_package_share_directory as _get_share
+    import os as _os
+    DEFAULT_STATION_COORD_JSON_PATH = _os.path.join(
+        _get_share('sml_system_pkg'), 'config', 'station_coordinates_a_zone.json'
+    )
+except Exception:
+    DEFAULT_STATION_COORD_JSON_PATH = ''
 
 
 class MockNavNode(Node):
