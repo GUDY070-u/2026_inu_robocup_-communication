@@ -23,6 +23,13 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+
+TASK_QOS = QoSProfile(
+    depth=1,
+    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+    reliability=QoSReliabilityPolicy.RELIABLE,
+)
 
 from sml_msgs.action import NavTask, WbTask
 from sml_msgs.msg import Task
@@ -99,7 +106,7 @@ class PlannerNode(Node):
 
         # --- ROS interfaces ---
         self._task_sub = self.create_subscription(
-            Task, task_topic, self._on_task, 10
+            Task, task_topic, self._on_task, TASK_QOS
         )
         self._wb_ready_sub = self.create_subscription(
             Int32, wb_ready_topic, self._on_wb_ready, 10
