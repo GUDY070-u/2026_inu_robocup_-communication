@@ -1,6 +1,7 @@
 string action
 int32[] object_ids
 int32 location
+int32 station_id
 int32[] slide_ids
 ---
 bool success
