@@ -17,6 +17,14 @@ MATERIAL_SIZE: dict = {
     5: '2x4', 6: '2x4', 7: '2x4', 8: '2x4',
 }
 
+# Batch ID → raw material ID (IDs 10-80: known type, ≥5 blocks guaranteed)
+BATCH_TO_MATERIAL: dict = {
+    10: 1, 20: 2, 30: 3, 40: 4,
+    50: 5, 60: 6, 70: 7, 80: 8,
+}
+BATCH_COUNT: int = 5    # treat each batch station as having exactly this many blocks
+MIX_BATCH_ID: int = 90  # unknown type/count batch
+
 # All 11 product definitions.
 # Single-column products list 'blocks' in bottom-to-top build order.
 # Workbench-only products list 'layers' in bottom-to-top order; each
