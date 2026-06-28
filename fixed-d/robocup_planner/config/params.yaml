@@ -1,0 +1,46 @@
+robocup_planner:
+  ros__parameters:
+
+    # Path to the AMR waypoint YAML provided by the AMR team.
+    # Update this on competition day with the actual path.
+    waypoint_yaml: "/home/robot/ros2_ws/src/robocup_navigator/params/robocup_waypoint.yaml"
+
+    # --- AMR Motion Parameters ---
+    # Cruising speed and acceleration between waypoints
+    driving_velocity: 0.5        # m/s
+    driving_acceleration: 0.3    # m/s^2
+
+    # Low-speed approach to parking position (sub_goal → goal leg)
+    parking_velocity: 0.15       # m/s
+    parking_acceleration: 0.1    # m/s^2
+
+    # Time from stopped to ready-to-move again (includes brake release)
+    parking_duration: 1.5        # seconds
+    exiting_duration: 1.0        # seconds
+
+    # --- Operation Durations ---
+    # Time the arm takes to pick one block from a shelf
+    loading_duration: 3.0        # seconds per block
+
+    # Time the arm takes to place one block onto a shelf or drop-zone
+    unloading_duration: 2.0      # seconds per block
+
+    # Time the workbench takes to assemble one product
+    workbench_assemble_duration: 15.0   # seconds
+
+    # Time the workbench takes to disassemble one recycled product
+    workbench_disassemble_duration: 10.0  # seconds
+
+    # --- Timing Compensation ---
+    time_offset: 0.0             # seconds — global additive offset for all estimates
+    error_margin: 2.0            # seconds — safety buffer added to each estimate
+
+    # --- ROS Topic / Action / Service Names ---
+    task_topic: "/eai/task"
+    nav_action: "/robocup/nav_task"
+    wb_action:  "/robocup/wb_task"
+    arm_service: "/arm/cargo"
+
+    # Topic published by the workbench when it finishes a product autonomously
+    # (used for the workbench interrupt signal)
+    wb_ready_topic: "/workbench/product_ready"
