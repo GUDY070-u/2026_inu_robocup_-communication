@@ -1,46 +1,37 @@
 robocup_planner:
   ros__parameters:
 
-    # Path to the AMR waypoint YAML provided by the AMR team.
-    # Update this on competition day with the actual path.
-    waypoint_yaml: "/home/robot/ros2_ws/src/robocup_navigator/params/robocup_waypoint.yaml"
+    # Path to the AMR waypoint YAML.
+    # ament_python 패키지 설치 후 share 디렉토리에 복사된 경로를 자동 참조합니다.
+    # 실제 로봇 환경에서는 아래 경로를 갱신된 맵 파일로 교체하세요.
+    waypoint_yaml: ""  # 비어 있으면 DistanceCalculator를 비활성화 (거리 inf)
+    # 아래 경로는 colcon install 후 자동 설정됩니다 (launch 파일에서 덮어씁니다):
+    # ~/.../install/robocup_planner/share/robocup_planner/config/robocup_waypoint.yaml
 
     # --- AMR Motion Parameters ---
-    # Cruising speed and acceleration between waypoints
     driving_velocity: 0.5        # m/s
     driving_acceleration: 0.3    # m/s^2
 
-    # Low-speed approach to parking position (sub_goal → goal leg)
     parking_velocity: 0.15       # m/s
     parking_acceleration: 0.1    # m/s^2
 
-    # Time from stopped to ready-to-move again (includes brake release)
     parking_duration: 1.5        # seconds
     exiting_duration: 1.0        # seconds
 
     # --- Operation Durations ---
-    # Time the arm takes to pick one block from a shelf
     loading_duration: 3.0        # seconds per block
-
-    # Time the arm takes to place one block onto a shelf or drop-zone
     unloading_duration: 2.0      # seconds per block
-
-    # Time the workbench takes to assemble one product
     workbench_assemble_duration: 15.0   # seconds
-
-    # Time the workbench takes to disassemble one recycled product
     workbench_disassemble_duration: 10.0  # seconds
 
     # --- Timing Compensation ---
-    time_offset: 0.0             # seconds — global additive offset for all estimates
-    error_margin: 2.0            # seconds — safety buffer added to each estimate
+    time_offset: 0.0
+    error_margin: 2.0
 
     # --- ROS Topic / Action / Service Names ---
-    task_topic: "/eai/task"
-    nav_action: "/robocup/nav_task"
-    wb_action:  "/robocup/wb_task"
-    arm_service: "/arm/cargo"
-
-    # Topic published by the workbench when it finishes a product autonomously
-    # (used for the workbench interrupt signal)
+    # (communication 레포 mock 노드 기준)
+    task_topic: "/sml/task"
+    nav_action: "navigate_to_station"
+    wb_action:  "wb_task"
+    arm_service: "/amr_robot_command"
     wb_ready_topic: "/workbench/product_ready"

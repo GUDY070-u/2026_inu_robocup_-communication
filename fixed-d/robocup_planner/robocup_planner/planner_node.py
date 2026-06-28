@@ -56,7 +56,18 @@ class PlannerNode(Node):
         super().__init__('robocup_planner')
 
         # --- Parameters ---
-        self.declare_parameter('waypoint_yaml', '')
+        # waypoint_yaml: ament share 디렉토리에서 자동 탐색
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            import os as _os
+            _default_wp = _os.path.join(
+                get_package_share_directory('robocup_planner'),
+                'config',
+                'robocup_waypoint.yaml',
+            )
+        except Exception:
+            _default_wp = ''
+        self.declare_parameter('waypoint_yaml', _default_wp)
         self.declare_parameter('task_topic', '/sml/task')
         self.declare_parameter('nav_action', 'navigate_to_station')
         self.declare_parameter('wb_action', 'wb_task')
