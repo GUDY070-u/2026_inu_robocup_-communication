@@ -35,10 +35,17 @@ from robocup_planner.planning.distance_calculator import DistanceCalculator
 from robocup_planner.planning.midlist_builder import (
     build_full_midlist,
     build_mid,
+    build_bidlist,
+    build_storage_midlist,
     check_storage_satisfies,
+    merge_into_midlist,
 )
 from robocup_planner.execution.executor import Executor, Plan
-from robocup_planner.product_catalog import is_intransit_eligible
+from robocup_planner.product_catalog import (
+    is_intransit_eligible,
+    BATCH_TO_MATERIAL,
+    BATCH_COUNT,
+)
 
 # Workbench WbTask goal strings
 WB_PRODUCE = 'PRODUCE'
@@ -56,7 +63,18 @@ class PlannerNode(Node):
         super().__init__('robocup_planner')
 
         # --- Parameters ---
-        self.declare_parameter('waypoint_yaml', '')
+        # waypoint_yaml: ament share 디렉토리에서 자동 탐색
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            import os as _os
+            _default_wp = _os.path.join(
+                get_package_share_directory('robocup_planner'),
+                'config',
+                'robocup_waypoint.yaml',
+            )
+        except Exception:
+            _default_wp = ''
+        self.declare_parameter('waypoint_yaml', _default_wp)
         self.declare_parameter('task_topic', '/sml/task')
         self.declare_parameter('nav_action', 'navigate_to_station')
         self.declare_parameter('wb_action', 'wb_task')
@@ -149,18 +167,39 @@ class PlannerNode(Node):
             f"Plan: produce={produce_ids}, recycle={recycle_ids}"
         )
 
-        # Categorise stations
-        storage_stations = []
+        # Categorise stations — separate regular storage from batch stations
+        storage_stations = []    # material_ids 1-8
+        batch_stations_1080 = [] # batch_ids 10-80 (known type, 5 blocks each)
+        batch_stations_90 = []   # mix batch ID 90 (unknown content)
         workbench_station_id = None
         customer_station_id = None
         customer_stations = []
 
         for st in msg.arena_layout:
             if st.station_type in (StationMsg.ST_STORAGE, StationMsg.ST_HYBRID):
-                storage_stations.append({
-                    'station_id': st.station_id,
-                    'material_ids': list(st.material_ids),
-                })
+                mids = [int(m) for m in st.material_ids]
+                regular = [m for m in mids if 1 <= m <= 8]
+                b1080 = [m for m in mids if 10 <= m <= 80]
+                b90 = [m for m in mids if m == 90]
+                if regular:
+                    storage_stations.append({
+                        'station_id': st.station_id,
+                        'material_ids': regular,
+                    })
+                if b1080:
+                    batch_stations_1080.append({
+                        'station_id': st.station_id,
+                        'batch_ids': b1080,
+                    })
+                if b90:
+                    batch_stations_90.append({
+                        'station_id': st.station_id,
+                        'batch_ids': [90],
+                    })
+                self.get_logger().info(
+                    f"Station {st.station_id}: regular={regular} "
+                    f"batch_1080={b1080} batch_90={b90}"
+                )
             if st.station_type in (StationMsg.ST_WORKBENCH, StationMsg.ST_HYBRID):
                 if workbench_station_id is None:
                     workbench_station_id = st.station_id
@@ -175,7 +214,7 @@ class PlannerNode(Node):
 
         home_id = 0
 
-        # Compute aidlist and net_aidlist
+        # Compute aidlist and net_aidlist (recycling already subtracted)
         aidlist, net_aidlist, recycled_materials = compute_net_aidlist(
             produce_ids, recycle_ids
         )
@@ -183,9 +222,8 @@ class PlannerNode(Node):
             f"aidlist={dict(aidlist)}, net_aidlist={dict(net_aidlist)}"
         )
 
-        # Build storage midlist from home to check availability
+        # Step A: build storage midlist and check if it alone satisfies net_aidlist
         if self._calc:
-            from robocup_planner.planning.midlist_builder import build_storage_midlist
             storage_mid = build_storage_midlist(storage_stations, self._calc, home_id)
         else:
             storage_mid = [
@@ -195,12 +233,51 @@ class PlannerNode(Node):
             ]
 
         satisfied, missing = check_storage_satisfies(storage_mid, net_aidlist)
-        needs_recycling = bool(recycle_ids)
 
-        if not satisfied and not recycle_ids:
-            self.get_logger().warning(
-                f"Cannot satisfy aidlist even with recycling — missing: {dict(missing)}"
+        # Step B: if not satisfied, add batch 10-80 and re-check
+        use_batch_1080 = False
+        if not satisfied and batch_stations_1080:
+            use_batch_1080 = True
+            if self._calc:
+                bidlist_1080 = build_bidlist(batch_stations_1080, self._calc, home_id)
+            else:
+                bidlist_1080 = [
+                    {
+                        'station_id': bst['station_id'],
+                        'materials': [
+                            BATCH_TO_MATERIAL[bid]
+                            for bid in bst['batch_ids']
+                            for _ in range(BATCH_COUNT)
+                        ],
+                        'distance': 0.0,
+                        'is_recycle_pickup': False,
+                        'recycle_product_id': None,
+                        'is_batch': True,
+                        'is_mix_batch': False,
+                    }
+                    for bst in batch_stations_1080
+                ]
+            merged_check = merge_into_midlist(storage_mid, bidlist_1080)
+            satisfied, missing = check_storage_satisfies(merged_check, net_aidlist)
+            self.get_logger().info(
+                f"After batch 10-80: satisfied={satisfied}, missing={dict(missing)}"
             )
+
+        # Step C: if still missing (after storage + batch_1080 + recycling already in net_aidlist),
+        # assign mix batch 90 to cover remaining shortage
+        missing_for_mix = missing if (not satisfied and batch_stations_90) else None
+        if missing_for_mix:
+            self.get_logger().info(
+                f"Mix batch 90 assigned for: {dict(missing_for_mix)}"
+            )
+
+        if not satisfied and not missing_for_mix:
+            self.get_logger().warning(
+                f"Cannot satisfy aidlist — missing: {dict(missing)}"
+            )
+
+        # Recycling is always triggered when recycle orders exist
+        needs_recycling = bool(recycle_ids)
 
         # Build recycle orders (map each recycle product to the customer station)
         recycle_orders = [
@@ -208,7 +285,7 @@ class PlannerNode(Node):
             for pid in recycle_ids
         ]
 
-        # Build full midlist
+        # Build full midlist with batch support
         if self._calc:
             full_midlist = build_full_midlist(
                 storage_stations=storage_stations,
@@ -218,6 +295,9 @@ class PlannerNode(Node):
                 home_station_id=home_id,
                 workbench_station_id=workbench_station_id,
                 needs_recycling=needs_recycling,
+                batch_stations_1080=batch_stations_1080 if use_batch_1080 else None,
+                batch_stations_90=batch_stations_90 if missing_for_mix else None,
+                missing_for_mix=missing_for_mix,
             )
         else:
             full_midlist = [
@@ -226,17 +306,29 @@ class PlannerNode(Node):
                  'recycle_product_id': o['product_id']}
                 for o in recycle_orders
             ] + storage_mid
+            if use_batch_1080:
+                for bst in batch_stations_1080:
+                    mats = [
+                        BATCH_TO_MATERIAL[bid]
+                        for bid in bst['batch_ids']
+                        for _ in range(BATCH_COUNT)
+                    ]
+                    full_midlist.append({
+                        'station_id': bst['station_id'],
+                        'materials': mats,
+                        'distance': float('inf'),
+                        'is_recycle_pickup': False,
+                        'recycle_product_id': None,
+                        'is_batch': True,
+                        'is_mix_batch': False,
+                    })
 
         # Build final mid list
         mid = build_mid(full_midlist, net_aidlist)
 
-        # Determine which products go to workbench vs in-transit
-        temp_alloc = CargoAllocator()
-        intransit_allocated = temp_alloc.allocate(produce_ids)
-        intransit_ids = list(intransit_allocated.keys())
-        workbench_ids = [
-            pid for pid in produce_ids if pid not in intransit_ids
-        ]
+        # In-transit disabled — all products go to workbench
+        intransit_ids: list = []
+        workbench_ids = list(produce_ids)
 
         # Surplus recycled materials (obtained beyond what net_aidlist needs)
         surplus = {}
