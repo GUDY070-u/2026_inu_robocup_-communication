@@ -28,7 +28,7 @@ from sml_system_pkg.arena_side_utils import (
 )
 
 DEFAULT_STATION_COORD_JSON_PATH = (
-    '/home/user/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
+    '/home/st02/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
 )
 
 

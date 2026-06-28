@@ -10,7 +10,7 @@ Example:
     from sml_system_pkg.gui_map_source import PlannerWaypointMapSource
 
     map_source = PlannerWaypointMapSource(
-        '/home/user/ros2_ws/src/sml_system_pkg/config/robocup_waypoint.yaml'
+        '/home/st02/ros2_ws/src/sml_system_pkg/config/robocup_waypoint.yaml'
     )
 
     # task is sml_msgs/msg/Task or compatible object.

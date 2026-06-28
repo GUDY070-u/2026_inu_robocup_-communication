@@ -32,9 +32,9 @@ from .amr_inventory import (
     command_from_items,
     describe_items,
     ROLE_PRODUCE_WB_RAW,
-    ROLE_PRODUCE_AMR_BASE,
-    ROLE_PRODUCE_AMR_UPPER,
-    ROLE_PRODUCE_AMR_PRODUCT,
+    ROLE_AMR_ASSEMBLE_BASE,
+    ROLE_AMR_ASSEMBLE_UPPER,
+    ROLE_AMR_ASSEMBLE_PRODUCT,
     ROLE_WB_PRODUCT,
     ROLE_RECYCLE_PRODUCT,
     ROLE_RECYCLE_PRODUCT_PRELOAD,
@@ -126,7 +126,7 @@ class PlannerCore:
         ]
 
         wb_produces = [po for po in produce_orders if self._is_wb_only(po)]
-        amr_produces = [po for po in produce_orders if not self._is_wb_only(po)]
+        amr_assemble_orders = [po for po in produce_orders if not self._is_wb_only(po)]
 
         # 1. Lifecycle reuse first: recycle products that directly feed produce orders.
         for recycle_order in linked_recycles:
@@ -137,7 +137,7 @@ class PlannerCore:
         wb_produces.sort(key=lambda po: len(po['materials']), reverse=True)
         for index, produce_order in enumerate(wb_produces):
             defer_customer_delivery = (
-                bool(amr_produces)
+                bool(amr_assemble_orders)
                 and index == len(wb_produces) - 1
             )
             self._append_wb_produce(
@@ -149,7 +149,7 @@ class PlannerCore:
         # 3. AMR-capable production, using assembly slots 7/8 and raw slides 2~6.
         #    At most two AMR products are prepared together because there are two
         #    assembly slots.
-        self._append_amr_produce_batches(amr_produces, station_info)
+        self._append_amr_assemble_batches(amr_assemble_orders, station_info)
 
         # 4. Recycle orders that do not help production are performed after useful work.
         #    In Recycling-only / standalone recycle flows, do not wait until the end
@@ -435,15 +435,15 @@ class PlannerCore:
             self.get_logger().info(f'[AMR ITEM step {sid}] {describe_items(item_list)}')
         return sid
 
-    def _append_amr_produce_batches(self, produce_orders, station_info):
+    def _append_amr_assemble_batches(self, produce_orders, station_info):
         if not produce_orders:
             return
 
         for i in range(0, len(produce_orders), len(ASSEMBLY_SLOT_INDICES)):
             batch = produce_orders[i:i + len(ASSEMBLY_SLOT_INDICES)]
-            self._append_amr_produce_batch(batch, station_info)
+            self._append_amr_assemble_batch(batch, station_info)
 
-    def _append_amr_produce_batch(self, batch, station_info):
+    def _append_amr_assemble_batch(self, batch, station_info):
         load_items = []
         order_runtime = []
 
@@ -469,7 +469,7 @@ class PlannerCore:
                 object_id=int(materials[0]),
                 slot_index=assembly_slot,
                 slide_id=assembly_slide,
-                role=ROLE_PRODUCE_AMR_BASE,
+                role=ROLE_AMR_ASSEMBLE_BASE,
                 order_index=order_index,
                 order_type='produce',
                 product_id=int(po['product_id']),
@@ -502,7 +502,7 @@ class PlannerCore:
                     object_id=int(source['raw']),
                     slot_index=slot_index,
                     slide_id=slide_id,
-                    role=ROLE_PRODUCE_AMR_UPPER,
+                    role=ROLE_AMR_ASSEMBLE_UPPER,
                     order_index=order_index,
                     order_type='produce',
                     product_id=int(po['product_id']),
@@ -543,7 +543,7 @@ class PlannerCore:
                 object_id=int(po['product_id']),
                 slot_index=int(runtime['assembly_slide']) % 10,
                 slide_id=int(runtime['assembly_slide']),
-                role=ROLE_PRODUCE_AMR_PRODUCT,
+                role=ROLE_AMR_ASSEMBLE_PRODUCT,
                 order_index=int(po['order_index']),
                 order_type='produce',
                 product_id=int(po['product_id']),
@@ -552,7 +552,7 @@ class PlannerCore:
             )
             product_items.append(product_item)
 
-        produce_sid = self._add_step(
+        assemble_sid = self._add_step(
             Step.AMR,
             Step.PRODUCE,
             product_ids,
@@ -561,14 +561,14 @@ class PlannerCore:
             produce_slides,
             validate_slide_len=False,
         )
-        self.step_items[int(produce_sid)] = list(product_items)
+        self.step_items[int(assemble_sid)] = list(product_items)
         self.get_logger().info(
-            f'[AMR batch produce] products={product_ids}, slides={produce_slides}, '
+            f'[AMR batch ASSEMBLE] products={product_ids}, slides={produce_slides}, '
             f'depends_on={self._unique_ints(produce_depends)}'
         )
 
         unload_items = list(product_items)
-        unload_depends = [int(produce_sid)]
+        unload_depends = [int(assemble_sid)]
         if deferred_wb_delivery is not None:
             unload_items.insert(0, deferred_wb_delivery['item'])
             unload_depends.append(int(deferred_wb_delivery['load_step_id']))
@@ -2009,7 +2009,6 @@ class PlannerCore:
         action_map = {
             Step.LOAD: 'LOAD   ',
             Step.UNLOAD: 'UNLOAD ',
-            Step.PRODUCE: 'PRODUCE',
             Step.RECYCLE: 'RECYCLE',
             Step.GOAL: 'GOAL   ',
         }
@@ -2021,7 +2020,7 @@ class PlannerCore:
                 move_time = self._travel_time(estimate_amr_station, int(step.station_id))
                 move_time += float(self.config.nav_overhead_sec)
                 arm_time = self._estimate_arm_action_time(step)
-                # AMR PRODUCE는 이동과 조립이 병렬이므로 max로 추정한다.
+                # AMR ASSEMBLE은 이동과 조립이 병렬이므로 max로 추정한다.
                 if step.action == Step.PRODUCE:
                     est_time = max(move_time, arm_time)
                 elif step.action == Step.GOAL:
@@ -2032,9 +2031,16 @@ class PlannerCore:
             elif step.type == Step.WB:
                 est_time = self._estimate_wb_action_time(step)
 
+            action_name = (
+                'ASSEMBLE'
+                if step.type == Step.AMR and step.action == Step.PRODUCE
+                else 'PRODUCE'
+                if step.type == Step.WB and step.action == Step.PRODUCE
+                else action_map.get(step.action, '?')
+            )
             self.get_logger().info(
                 f'[{step.step_id:2d}] {type_map.get(step.type, "??")} | '
-                f'{action_map.get(step.action, "?")} | '
+                f'{action_name} | '
                 f'objects={list(step.object_ids)} | '
                 f'station={step.station_id} | '
                 f'slide_ids={list(step.slide_ids)} | '

@@ -36,9 +36,9 @@ ASSEMBLY_SLOTS = tuple(ASSEMBLY_SLOT_INDICES)
 # ---------------------------------------------------------------------------
 
 ROLE_PRODUCE_WB_RAW = "produce_wb_raw"
-ROLE_PRODUCE_AMR_BASE = "produce_amr_base"
-ROLE_PRODUCE_AMR_UPPER = "produce_amr_upper"
-ROLE_PRODUCE_AMR_PRODUCT = "produce_amr_product"
+ROLE_AMR_ASSEMBLE_BASE = "amr_assemble_base"
+ROLE_AMR_ASSEMBLE_UPPER = "amr_assemble_upper"
+ROLE_AMR_ASSEMBLE_PRODUCT = "amr_assemble_product"
 ROLE_WB_PRODUCT = "wb_product"
 
 ROLE_RECYCLE_PRODUCT = "recycle_product"

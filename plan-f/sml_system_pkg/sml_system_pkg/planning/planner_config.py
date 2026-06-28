@@ -71,11 +71,11 @@ NAV_OVERHEAD_SEC = 0.0
 
 STATION_COORD_JSON_PARAM = 'station_coord_json_path'
 DEFAULT_STATION_COORD_JSON_PATH = (
-    '/home/user/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
+    '/home/st02/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
 )
 WAYPOINT_YAML_PARAM = 'waypoint_yaml_path'
 DEFAULT_WAYPOINT_YAML_PATH = (
-    '/home/user/ros2_ws/src/sml_system_pkg/config/robocup_waypoint.yaml'
+    '/home/st02/ros2_ws/src/sml_system_pkg/config/robocup_waypoint.yaml'
 )
 
 # Optional fixed costs added to waypoint-based navigation estimates.

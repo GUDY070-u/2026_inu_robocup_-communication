@@ -31,22 +31,22 @@ def _manager_for_slot_test():
     return manager
 
 
-def test_produce_product_inherits_base_physical_position():
+def test_assembled_product_inherits_base_physical_position():
     manager = _manager_for_slot_test()
 
     # raw 8(size 2)은 logical slide 6에서 physical arm slide 51을 차지한다.
     assert manager._assign_raw_arm_position(6, 8) == 51
 
-    produce_step = SimpleNamespace(
+    assemble_step = SimpleNamespace(
         step_id=3,
         slide_ids=[6, 1],
         object_ids=[81],
     )
     assert manager._convert_step_slide_ids_for_arm(
-        produce_step, 'PRODUCE'
+        assemble_step, 'ASSEMBLE'
     ) == [51, 1]
 
-    manager._commit_amr_produce_slot_changes(produce_step)
+    manager._commit_amr_assemble_slot_changes(assemble_step)
 
     # 완성품 81이 raw 8의 정확한 물리 위치 51을 이어받아야 한다.
     unload_step = SimpleNamespace(

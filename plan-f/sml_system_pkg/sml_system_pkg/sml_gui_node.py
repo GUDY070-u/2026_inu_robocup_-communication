@@ -20,7 +20,7 @@ Run:
 Optional:
     ros2 run sml_system_pkg sml_gui_node --ros-args \
       -p side:=a \
-      -p station_coord_json:=/home/user/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json \
+      -p station_coord_json:=/home/st02/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json \
       -p gui_invert_y:=true
 
 If tkinter is missing:
@@ -105,7 +105,15 @@ BATCH_TO_RAW = {10: 1, 20: 2, 30: 3, 40: 4, 50: 5, 60: 6, 70: 7, 80: 8}
 
 STATION_TYPE_NAMES = {1: "Storage", 2: "Workbench", 3: "Customer", 4: "Hybrid"}
 STEP_TYPE_NAMES = {0: "AMR", 1: "WB"}
-STEP_ACTION_NAMES = {0: "LOAD", 1: "UNLOAD", 2: "PRODUCE", 3: "RECYCLE", 4: "GOAL"}
+STEP_ACTION_NAMES = {0: "LOAD", 1: "UNLOAD", 3: "RECYCLE", 4: "GOAL"}
+
+
+def step_action_name(step_type: int, action: int) -> str:
+    if int(action) == 2:
+        return "ASSEMBLE" if int(step_type) == 0 else "PRODUCE"
+    return STEP_ACTION_NAMES.get(int(action), str(action))
+
+
 SLOT_LABELS = {
     PRODUCT_SLOT_INDEX: f"{PRODUCT_SLOT_INDEX} Product",
     **{slot: f"{slot} Raw" for slot in RAW_SLOT_INDICES},
@@ -514,8 +522,8 @@ class SmlGuiNode(Node):
                 self._state_amr_load(station_id, objects, slides)
             elif action == 1:  # UNLOAD
                 self._state_amr_unload(station_id, objects, slides)
-            elif action == 2:  # AMR PRODUCE
-                self._state_amr_produce(objects, slides)
+            elif action == 2:  # AMR ASSEMBLE (Step.PRODUCE compatibility enum)
+                self._state_amr_assemble(objects, slides)
             elif action == 4:  # GOAL
                 self.state.amr_station = side_to_start_goal_station(self.side)
         elif step_type == 1:  # WB
@@ -529,7 +537,7 @@ class SmlGuiNode(Node):
         self.applied_step_ids.add(sid)
         self.status_var.set(
             f"step {sid} 적용: {STEP_TYPE_NAMES.get(step_type, step_type)} "
-            f"{STEP_ACTION_NAMES.get(action, action)} objects={objects} station={station_id}"
+            f"{step_action_name(step_type, action)} objects={objects} station={station_id}"
         )
 
     def _consume_station_object(self, station_id: int, obj: int) -> bool:
@@ -615,7 +623,7 @@ class SmlGuiNode(Node):
             if self.state.station_types.get(station_id) == 2:
                 self.state.wb_items.setdefault(station_id, []).append(int(obj))
 
-    def _state_amr_produce(self, objects: List[int], slides: List[int]) -> None:
+    def _state_amr_assemble(self, objects: List[int], slides: List[int]) -> None:
         if not objects:
             return
 
@@ -700,7 +708,7 @@ class SmlGuiNode(Node):
             values = (
                 sid,
                 STEP_TYPE_NAMES.get(int(st.type), str(st.type)),
-                STEP_ACTION_NAMES.get(int(st.action), str(st.action)),
+                step_action_name(int(st.type), int(st.action)),
                 int(st.station_id),
                 compact_list(list(st.object_ids), 10),
                 compact_list(list(st.slide_ids), 10),

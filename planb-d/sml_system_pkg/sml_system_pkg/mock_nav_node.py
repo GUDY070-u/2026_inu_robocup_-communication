@@ -22,7 +22,7 @@ from std_srvs.srv import Trigger
 from sml_msgs.action import NavTask
 
 DEFAULT_STATION_COORD_JSON_PATH = (
-    '/home/user/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
+    '/home/st02/ros2_ws/src/sml_system_pkg/config/station_coordinates_a_zone.json'
 )
 
 

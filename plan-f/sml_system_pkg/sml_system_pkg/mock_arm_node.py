@@ -4,7 +4,7 @@ mock_arm_node.py
 
 Plan D 시간 모델:
   - LOAD/UNLOAD: 물체 개수 × per-item 시간
-  - PRODUCE: product_id의 연결 개수 × AMR 조립 시간
+  - ASSEMBLE: product_id의 연결 개수 × AMR 조립 시간
 
 인터페이스:
     Request:
@@ -53,7 +53,7 @@ class MockArmNode(Node):
         self.declare_parameter('load_time_sec_per_item', 2.0)
         self.declare_parameter('unload_time_sec_per_item', 2.0)
         self.declare_parameter('amr_assemble_time_sec_per_connection', 4.0)
-        self.declare_parameter('amr_produce_base_time_sec', 0.0)
+        self.declare_parameter('amr_assemble_base_time_sec', 0.0)
         self.declare_parameter('fallback_delay_sec', 0.5)
         self.declare_parameter('max_delay_sec', 600.0)
 
@@ -88,8 +88,8 @@ class MockArmNode(Node):
             delay = n_objects * self._p('load_time_sec_per_item')
         elif action == 'UNLOAD':
             delay = n_objects * self._p('unload_time_sec_per_item')
-        elif action == 'PRODUCE':
-            base = self._p('amr_produce_base_time_sec')
+        elif action == 'ASSEMBLE':
+            base = self._p('amr_assemble_base_time_sec')
             per_connection = self._p('amr_assemble_time_sec_per_connection')
             # 보통 object_ids=[product_id] 형태다.
             connections = 0
