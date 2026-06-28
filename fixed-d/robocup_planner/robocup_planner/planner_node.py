@@ -149,6 +149,23 @@ class PlannerNode(Node):
     # Planning phase
     # ------------------------------------------------------------------
 
+    # batch ID(10,20,...,80) → raw material ID(1,2,...,8) 변환표
+    # order_server가 arena_layout에 배치 ID를 넣으므로 raw ID로 풀어야 함
+    _BATCH_TO_RAW: dict = {
+        10: 1, 20: 2, 30: 3, 40: 4,
+        50: 5, 60: 6, 70: 7, 80: 8,
+    }
+
+    @staticmethod
+    def _resolve_material_ids(raw_ids) -> list:
+        """배치 ID가 섞여 있어도 raw material ID 목록으로 변환한다."""
+        result = []
+        for mid in raw_ids:
+            mid = int(mid)
+            resolved = PlannerNode._BATCH_TO_RAW.get(mid, mid)
+            result.append(resolved)
+        return result
+
     def _plan(self, msg: Task) -> Plan:
         from sml_msgs.msg import Station as StationMsg
 
@@ -168,10 +185,16 @@ class PlannerNode(Node):
 
         for st in msg.arena_layout:
             if st.station_type in (StationMsg.ST_STORAGE, StationMsg.ST_HYBRID):
+                # 버그 1 수정: 배치 ID → raw material ID 변환
+                raw_mat_ids = self._resolve_material_ids(st.material_ids)
                 storage_stations.append({
                     'station_id': st.station_id,
-                    'material_ids': list(st.material_ids),
+                    'material_ids': raw_mat_ids,
                 })
+                self.get_logger().info(
+                    f"Station {st.station_id}: raw material_ids={raw_mat_ids} "
+                    f"(original={list(st.material_ids)})"
+                )
             if st.station_type in (StationMsg.ST_WORKBENCH, StationMsg.ST_HYBRID):
                 if workbench_station_id is None:
                     workbench_station_id = st.station_id
@@ -241,13 +264,10 @@ class PlannerNode(Node):
         # Build final mid list
         mid = build_mid(full_midlist, net_aidlist)
 
-        # Determine which products go to workbench vs in-transit
-        temp_alloc = CargoAllocator()
-        intransit_allocated = temp_alloc.allocate(produce_ids)
-        intransit_ids = list(intransit_allocated.keys())
-        workbench_ids = [
-            pid for pid in produce_ids if pid not in intransit_ids
-        ]
+        # 버그 2 수정: 인트랜짓 비활성화 — 모든 제품을 워크벤치로 처리
+        # (인트랜짓은 픽업 순서와 build_order가 일치해야 하는 미구현 제약이 있음)
+        intransit_ids: list = []
+        workbench_ids = list(produce_ids)
 
         # Surplus recycled materials (obtained beyond what net_aidlist needs)
         surplus = {}
