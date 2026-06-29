@@ -1,0 +1,232 @@
+"""ROS2 planning node wrapper.
+
+The actual planning algorithm lives in sml_system_pkg.planning.*.
+This file intentionally keeps only ROS subscription/service wiring.
+
+A/B 경기장 대응:
+- Adapter가 넘긴 AMR 실제 station id를 PlannerCore 계산용 station id로 변환한다.
+- side:=b일 때는 9~17을 계산용 0~8로 바꿔 PlannerCore/기존 JSON을 그대로 사용한다.
+- PlannerCore가 만든 Step은 다시 AMR 실제 station id로 복원한다.
+
+Navigator 비용 반영:
+- robocup_waypoint.yaml을 읽어 station 간 이동비용을 waypoint sequence 기반으로 계산한다.
+- Step 출력은 여전히 station_id만 사용한다. 실제 waypoint 이동은 RobocupNavigator가 수행한다.
+"""
+
+import rclpy
+from rclpy.node import Node
+
+from sml_msgs.msg import Task, Station
+from sml_msgs.srv import GetPlan
+
+from .arena_side_utils import (
+    normalize_side,
+    side_to_fixed_workbench_station,
+    amr_station_to_planner_station,
+    planner_station_to_amr_station,
+)
+from .planning.arena_parser import load_station_coord_json
+from .planning.planner_config import (
+    AMR_SPEED,
+    DEFAULT_STATION_COORD_JSON_PATH,
+    DEFAULT_WAYPOINT_YAML_PATH,
+    NAV_ALIGN_TIME_AVG,
+    NAV_ALIGN_TIME_PARAM,
+    NAV_POST_TIME_AVG,
+    NAV_POST_TIME_PARAM,
+    STATION_COORD_JSON_PARAM,
+    WAYPOINT_YAML_PARAM,
+    PlannerConfig,
+)
+from .planning.planner_core import PlannerCore
+from .planning.waypoint_cost import load_waypoint_cost_map
+
+
+class PlanningNode(Node):
+
+    def __init__(self):
+        super().__init__('planning_node')
+
+        self.plan_generated = False
+        self.steps = []
+
+        self.declare_parameter('task_topic', '/sml/task')
+        self.declare_parameter('side', 'a')
+        self.declare_parameter('use_time_cost', True)
+        self.declare_parameter('amr_speed_mps', AMR_SPEED)
+        self.declare_parameter(
+            STATION_COORD_JSON_PARAM,
+            DEFAULT_STATION_COORD_JSON_PATH
+        )
+        self.declare_parameter(
+            WAYPOINT_YAML_PARAM,
+            DEFAULT_WAYPOINT_YAML_PATH
+        )
+        self.declare_parameter(NAV_ALIGN_TIME_PARAM, NAV_ALIGN_TIME_AVG)
+        self.declare_parameter(NAV_POST_TIME_PARAM, NAV_POST_TIME_AVG)
+
+        task_topic = self.get_parameter('task_topic').value
+        self.side = normalize_side(self.get_parameter('side').value)
+        self.fixed_workbench_station = side_to_fixed_workbench_station(self.side)
+
+        use_time_cost = bool(self.get_parameter('use_time_cost').value)
+        amr_speed_mps = float(self.get_parameter('amr_speed_mps').value)
+        station_coord_json_path = self.get_parameter(
+            STATION_COORD_JSON_PARAM
+        ).get_parameter_value().string_value.strip()
+        waypoint_yaml_path = self.get_parameter(
+            WAYPOINT_YAML_PARAM
+        ).get_parameter_value().string_value.strip()
+        nav_align_time_avg = float(self.get_parameter(NAV_ALIGN_TIME_PARAM).value)
+        nav_post_time_avg = float(self.get_parameter(NAV_POST_TIME_PARAM).value)
+
+        config = PlannerConfig(
+            use_time_cost=use_time_cost,
+            amr_speed_mps=amr_speed_mps,
+            station_coord_json_path=station_coord_json_path,
+            waypoint_yaml_path=waypoint_yaml_path,
+            nav_align_time_avg=nav_align_time_avg,
+            nav_post_time_avg=nav_post_time_avg,
+            fixed_workbench_station_id=amr_station_to_planner_station(
+                self.fixed_workbench_station,
+                self.side,
+            ),
+        )
+        station_coords = load_station_coord_json(
+            config.station_coord_json_path,
+            self.get_logger(),
+        )
+        waypoint_cost_map = load_waypoint_cost_map(
+            config.waypoint_yaml_path,
+            self.get_logger(),
+        )
+
+        self.planner = PlannerCore(
+            config=config,
+            station_coords=station_coords,
+            waypoint_cost_map=waypoint_cost_map,
+            logger=self.get_logger(),
+        )
+
+        self.task_sub = self.create_subscription(
+            Task, task_topic, self.task_callback, 10
+        )
+        self.plan_srv = self.create_service(
+            GetPlan, '/sml/get_plan', self.get_plan_callback
+        )
+
+        waypoint_count = len(waypoint_cost_map) if waypoint_cost_map is not None else 0
+        self.get_logger().info(
+            f'PlanningNode 시작 | task_topic={task_topic} | side={self.side} | '
+            f'fixed_workbench_station={self.fixed_workbench_station} | '
+            f'use_time_cost={use_time_cost} | coords={len(station_coords)} | '
+            f'waypoint_stations={waypoint_count} | '
+            f'nav_align_time_avg={nav_align_time_avg:.2f}s | '
+            f'nav_post_time_avg={nav_post_time_avg:.2f}s'
+        )
+
+    def _task_for_planner_coordinates(self, task: Task) -> Task:
+        """
+        PlannerCore/JSON/YAML 계산용 Task 생성.
+
+        side a:
+            station_id를 그대로 사용.
+
+        side b:
+            Adapter가 만든 AMR station id 9~17을 PlannerCore 계산용 0~8로 변환.
+            예: 9(B 시작/골) -> 0, 16(B WB 로봇) -> 7.
+        """
+        if self.side == 'a':
+            return task
+
+        planner_task = Task()
+        planner_task.order_list = list(task.order_list)
+        planner_task.arena_layout = []
+
+        for src_station in task.arena_layout:
+            dst_station = Station()
+            dst_station.station_type = int(src_station.station_type)
+            dst_station.station_id = amr_station_to_planner_station(
+                int(src_station.station_id),
+                self.side,
+            )
+            dst_station.material_ids = list(src_station.material_ids)
+            planner_task.arena_layout.append(dst_station)
+
+            self.get_logger().info(
+                '[PLANNER] station 계산용 변환: '
+                f'amr_id={int(src_station.station_id)} -> '
+                f'planner_id={dst_station.station_id}, '
+                f'type={dst_station.station_type}, '
+                f'materials={list(dst_station.material_ids)}'
+            )
+
+        return planner_task
+
+    def _steps_to_amr_station_ids(self, steps):
+        """
+        PlannerCore 결과 Step의 station_id를 AMR 실제 station id로 복원.
+        side b:
+            0 -> 9, 6 -> 15, 8 -> 17 등으로 변환.
+        """
+        if self.side == 'a':
+            return steps
+
+        for step in steps:
+            old_station = int(step.station_id)
+            new_station = planner_station_to_amr_station(old_station, self.side)
+            step.station_id = int(new_station)
+
+            if old_station != new_station:
+                self.get_logger().info(
+                    '[PLANNER] step station AMR용 복원: '
+                    f'step={step.step_id}, '
+                    f'planner_station={old_station} -> amr_station={new_station}'
+                )
+
+        return steps
+
+    def task_callback(self, task):
+        if self.plan_generated:
+            return
+
+        self.plan_generated = True
+        self.get_logger().info('Task 수신 → 계획 생성 시작')
+
+        try:
+            planner_task = self._task_for_planner_coordinates(task)
+            planned_steps = self.planner.build_plan(planner_task)
+            self.steps = self._steps_to_amr_station_ids(planned_steps)
+        except Exception as e:
+            self.steps = []
+            self.plan_generated = False
+            self.get_logger().error(f'계획 생성 실패: {e}')
+
+    def get_plan_callback(self, request, response):
+        if not self.plan_generated or not self.steps:
+            response.success = False
+            response.message = '계획이 아직 생성되지 않았습니다'
+            return response
+
+        response.steps = self.steps
+        response.success = True
+        response.message = ''
+        self.get_logger().info(f'GetPlan 응답: {len(self.steps)}개 스텝 전달')
+        return response
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PlanningNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
