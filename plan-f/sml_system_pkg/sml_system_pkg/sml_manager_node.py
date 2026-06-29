@@ -30,7 +30,10 @@ from sml_system_pkg.arena_side_utils import (
     nav_target_for_station,
     side_to_fixed_workbench_station,
 )
-from sml_system_pkg.planning.planner_config import RAW_SLOT_INDICES
+from sml_system_pkg.planning.planner_config import (
+    ASSEMBLY_SLOT_INDICES,
+    RAW_SLOT_INDICES,
+)
 
 
 ARM_ACTION_ASSEMBLE = 'ASSEMBLE'
@@ -771,23 +774,120 @@ class SmlManagerNode(Node):
         return converted
 
     def _send_amr_assemble_arm(self, step, nav_target, retry=0):
+        arm_slide_ids = self._convert_step_slide_ids_for_arm(
+            step, ARM_ACTION_ASSEMBLE
+        )
+        try:
+            encoded_slide_ids = self._encode_amr_assemble_slides(
+                step, arm_slide_ids
+            )
+        except ValueError as exc:
+            self._fail_amr_assemble_step(step, str(exc))
+            return
+        self._send_amr_assemble_request(
+            step, encoded_slide_ids, retry
+        )
+
+    def _encode_amr_assemble_slides(self, step, arm_slide_ids):
+        """
+        ASSEMBLE 입력 위치에 주문과 조립 순서를 함께 인코딩한다.
+
+            encoded = (
+                1000 * slide_number
+                + 100 * slide_position
+                + 10 * batch_order
+                + assembly_order
+            )
+
+        batch_order는 이 ASSEMBLE 요청 안에서의 제품 순서(0 또는 1)다.
+        assembly_order는 해당 제품 레시피 안의 재료 순서다. 따라서 ARM은
+        하나의 요청에서도 제품별 입력과 결과 조립 슬롯을 구분할 수 있다.
+        """
+        product_ids = [int(x) for x in step.object_ids]
+        logical_slide_ids = [int(x) for x in getattr(step, 'slide_ids', [])]
+        physical_slide_ids = [int(x) for x in arm_slide_ids]
+
+        if len(logical_slide_ids) != len(physical_slide_ids):
+            raise ValueError(
+                'ASSEMBLE logical/physical slide 개수가 다릅니다: '
+                f'logical={logical_slide_ids}, physical={physical_slide_ids}'
+            )
+
+        order_keys = []
+        for logical_sid in logical_slide_ids:
+            order_key = abs(logical_sid) // 10
+            if order_key not in order_keys:
+                order_keys.append(order_key)
+
+        if len(order_keys) != len(product_ids):
+            raise ValueError(
+                'ASSEMBLE 제품 수와 slide 그룹 수가 다릅니다: '
+                f'products={product_ids}, logical_slides={logical_slide_ids}'
+            )
+
+        batch_order_by_key = {
+            order_key: batch_order
+            for batch_order, order_key in enumerate(order_keys)
+        }
+        assembly_order_by_key = {
+            order_key: 0 for order_key in order_keys
+        }
+        encoded_slide_ids = []
+
+        for logical_sid, arm_slide_id in zip(
+                logical_slide_ids, physical_slide_ids):
+            order_key = abs(logical_sid) // 10
+            logical_slot = abs(logical_sid) % 10
+            batch_order = batch_order_by_key[order_key]
+            assembly_order = assembly_order_by_key[order_key]
+
+            if batch_order > 9 or assembly_order > 9:
+                raise ValueError(
+                    'ASSEMBLE 인덱스는 한 자리 숫자여야 합니다: '
+                    f'batch_order={batch_order}, '
+                    f'assembly_order={assembly_order}'
+                )
+
+            if logical_slot in ASSEMBLY_SLOT_INDICES:
+                # Assembly spaces 7/8 have no internal pick position.
+                slide_number = int(logical_slot)
+                slide_position = 0
+            else:
+                # Raw arm_slide_id = raw_slide_number * 10 + pick_position.
+                slide_number = int(arm_slide_id) // 10
+                slide_position = int(arm_slide_id) % 10
+
+            encoded_slide_ids.append(
+                1000 * slide_number
+                + 100 * slide_position
+                + 10 * int(batch_order)
+                + int(assembly_order)
+            )
+            assembly_order_by_key[order_key] += 1
+
+        return encoded_slide_ids
+
+    def _send_amr_assemble_request(
+            self, step, encoded_slide_ids, retry=0):
         req = ArmCommand.Request()
         # Step.PRODUCE is retained only as the sml_msgs compatibility enum.
         req.action = ARM_ACTION_ASSEMBLE
         req.object_ids = list(step.object_ids)
         req.location = int(step.station_id)
         req.station_id = int(step.station_id)
-        arm_slide_ids = self._set_arm_request_slide_ids(req, step, req.action)
+        req.slide_ids = list(encoded_slide_ids)
 
         self.get_logger().info(
             f'[ARM/ASSEMBLE] step {step.step_id} → '
-            f'{req.action} product={list(step.object_ids)} | '
-            f'location={req.location} | arm_slide_ids={arm_slide_ids}'
+            f'{req.action} product={list(req.object_ids)} | '
+            f'location={req.location} | '
+            f'encoded_slide_ids={list(req.slide_ids)}'
         )
 
         future = self.arm_client.call_async(req)
         future.add_done_callback(
-            lambda f, s=step, r=retry: self._on_amr_assemble_arm_result(f, s, r))
+            lambda f, s=step, es=list(encoded_slide_ids), r=retry:
+            self._on_amr_assemble_arm_result(f, s, es, r))
 
     def _get_amr_assemble_nav_target(self, step):
         with self._lock:
@@ -841,7 +941,8 @@ class SmlManagerNode(Node):
             f'[NAV/ASSEMBLE] step {step.step_id} 도착 완료')
         self._mark_amr_assemble_part_done(step, 'nav')
 
-    def _on_amr_assemble_arm_result(self, future, step, retry):
+    def _on_amr_assemble_arm_result(
+            self, future, step, encoded_slide_ids, retry):
         MAX_RETRY = 1
 
         try:
@@ -850,11 +951,11 @@ class SmlManagerNode(Node):
             self.get_logger().error(
                 f'[ARM/ASSEMBLE] step {step.step_id} 예외: {e}')
             if retry < MAX_RETRY:
-                nav_target = self._get_amr_assemble_nav_target(step)
                 self.get_logger().warn(
                     f'[ARM/ASSEMBLE] step {step.step_id} 재시도 '
                     f'({retry+1}/{MAX_RETRY})')
-                self._send_amr_assemble_arm(step, nav_target, retry + 1)
+                self._send_amr_assemble_request(
+                    step, encoded_slide_ids, retry + 1)
             else:
                 self._fail_amr_assemble_step(
                     step, f'ARM ASSEMBLE 예외: {e}')
@@ -867,19 +968,37 @@ class SmlManagerNode(Node):
 
             retriable = 'object not found' not in message.lower()
             if retry < MAX_RETRY and retriable:
-                nav_target = self._get_amr_assemble_nav_target(step)
                 self.get_logger().warn(
                     f'[ARM/ASSEMBLE] step {step.step_id} 재시도 '
                     f'({retry+1}/{MAX_RETRY})')
-                self._send_amr_assemble_arm(step, nav_target, retry + 1)
+                self._send_amr_assemble_request(
+                    step, encoded_slide_ids, retry + 1)
             else:
                 self._fail_amr_assemble_step(
                     step, f'ARM ASSEMBLE 최종 실패: {message}')
             return
 
+        expected_slots = []
+        seen_orders = set()
+        for encoded in encoded_slide_ids:
+            batch_order = (int(encoded) // 10) % 10
+            if batch_order in seen_orders:
+                continue
+            seen_orders.add(batch_order)
+            expected_slots.append(int(encoded) // 1000)
+
+        returned_slots = [int(x) for x in response.slots]
+        if returned_slots != expected_slots:
+            self._fail_amr_assemble_step(
+                step,
+                '조립 슬롯 불일치: '
+                f'expected={expected_slots}, response={returned_slots}',
+            )
+            return
+
         self.get_logger().info(
             f'[ARM/ASSEMBLE] step {step.step_id} 조립 완료 '
-            f'| slots={list(response.slots)}')
+            f'| slots={returned_slots}')
         self._commit_amr_assemble_slot_changes(step)
         self._mark_amr_assemble_part_done(step, 'arm')
 

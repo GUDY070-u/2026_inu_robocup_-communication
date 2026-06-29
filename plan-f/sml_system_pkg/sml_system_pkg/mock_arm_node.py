@@ -119,11 +119,27 @@ class MockArmNode(Node):
         time.sleep(delay_sec)
 
         response.success = True
-        response.slots = (
-            list(request.slide_ids)
-            if len(request.slide_ids) > 0
-            else list(range(1, len(request.object_ids) + 1))
-        )
+        if str(request.action).upper() == 'ASSEMBLE':
+            # ASSEMBLE slide:
+            #   1000 * slide_number + 100 * slide_position
+            #   + 10 * batch_order + assembly_order
+            # 각 제품의 assembly_order=0 위치가 완성품 결과 슬롯이다.
+            output_slots = []
+            seen_orders = set()
+            for encoded in request.slide_ids:
+                encoded = int(encoded)
+                batch_order = (encoded // 10) % 10
+                assembly_order = encoded % 10
+                if assembly_order == 0 and batch_order not in seen_orders:
+                    seen_orders.add(batch_order)
+                    output_slots.append(encoded // 1000)
+            response.slots = output_slots
+        else:
+            response.slots = (
+                list(request.slide_ids)
+                if len(request.slide_ids) > 0
+                else list(range(1, len(request.object_ids) + 1))
+            )
         response.object_ids = list(request.object_ids)
         response.message = 'mock success'
 

@@ -65,3 +65,19 @@ def test_assembled_product_inherits_base_physical_position():
     manager._commit_arm_slot_removals(unload_step)
     assert manager._arm_raw_slots[6]['units'] == [None, None, None]
     assert (6, 81) not in manager._arm_item_keys
+
+
+def test_batched_assemble_encodes_position_order_and_assembly_sequence():
+    manager = _manager_for_slot_test()
+
+    step = SimpleNamespace(
+        step_id=3,
+        slide_ids=[7, 2, 18, 12, 13],
+        object_ids=[81, 442],
+    )
+
+    encoded = manager._encode_amr_assemble_slides(
+        step, [7, 10, 8, 12, 20]
+    )
+
+    assert encoded == [7000, 1001, 8010, 1211, 2012]
